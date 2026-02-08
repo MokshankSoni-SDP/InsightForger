@@ -1,429 +1,372 @@
 """
-Metric Resolver Module.
-
-Deterministically maps abstract business intent (from LLM) to concrete data columns or derived metrics.
-Enforces validation and prevents hallucination.
+Phase 2: Autonomous Metric Resolver with Polars Formula Factory
 """
-from dataclasses import dataclass
-from typing import Optional, List, Literal
-import json
-from core.metric_blueprint import BlueprintClassifier, MetricType, MetricBlueprint
-from utils.schemas import SemanticProfile
-from core.derived_metrics_registry import get_derived_metric
+import os
+import re
+from typing import List, Dict, Any, Optional, Tuple
+from dotenv import load_dotenv
+import polars as pl
+from utils.schemas import (
+    BusinessContext, SemanticProfile, Hypothesis,
+    ExecutionPlan, AggregationScope, EntityProfile
+)
 from utils.helpers import get_logger
 
+load_dotenv()
 logger = get_logger(__name__)
 
-# Sprint 1: Synonym mapping for abstract business metrics
-# Maps common business terms to column name patterns
-METRIC_SYNONYMS = {
-    'profitability': ['profit', 'margin', 'earnings'],
-    'revenue': ['sales', 'income', 'receipts'],
-    'cost': ['expense', 'spend', 'expenditure'],
-    'efficiency': ['productivity', 'utilization', 'throughput'],
-    'performance': ['results', 'outcomes', 'achievement'],
-    'growth': ['increase', 'expansion', 'development'],
-    'retention': ['loyalty', 'churn', 'attrition'],
-    'acquisition': ['onboarding', 'signup', 'conversion']
-}
 
-@dataclass
-class ResolutionResult:
-    resolved_metric: Optional[str]
-    resolution_confidence: float
-    resolution_type: Literal["direct", "derived", "failed", "unsupported"]
-    dependencies: List[str]
-    explanation: str
-    formula_name: Optional[str] = None # Name of registry item if derived
+# ============================================================================
+# POLARS FORMULA FACTORY
+# ============================================================================
+
+def _format_dims(dims):
+    """Helper to format dimensions for f-string."""
+    return ', '.join([f"'{d}'" for d in dims])
+
+
+class PolarsFormulaBuilder:
+    """
+    Dynamic formula generator for Polars expressions.
+    
+    Builds executable Polars code based on mathematical relationships,
+    not hardcoded column names.
+    """
+    
+    # Formula templates (lambda functions for dynamic generation)
+    FORMULA_TEMPLATES = {
+        "SAME_ROW": lambda n, d: f"pl.col('{n}') / pl.col('{d}')",
+        "GLOBAL_SUM": lambda n, d: f"pl.col('{n}') / pl.col('{d}').sum()",
+        "GROUP_SUM": lambda n, d, dims: f"pl.col('{n}').sum() / pl.col('{d}').sum().over([{_format_dims(dims)}])",
+        "DIMENSIONAL": lambda n, d: f"pl.col('{n}').sum() / pl.col('{d}').sum()",
+        "MEAN": lambda n: f"pl.col('{n}').mean()",
+        "SUM": lambda n: f"pl.col('{n}').sum()",
+        "GROWTH": lambda n: f"(pl.col('{n}') - pl.col('{n}').shift(1)) / pl.col('{n}').shift(1) * 100"
+    }
+    
+    def build_ratio_formula(
+        self,
+        numerator: str,
+        denominator: Optional[str],
+        scope: Optional[str],
+        dimensions: List[str] = None
+    ) -> str:
+        """
+        Build Polars expression for ratio calculation.
+        
+        Args:
+            numerator: Physical column name for numerator
+            denominator: Physical column name for denominator (None for non-ratio metrics)
+            scope: Denominator scope (SAME_ROW, GLOBAL_SUM, GROUP_SUM, DIMENSIONAL)
+            dimensions: List of dimension columns for grouping
+        
+        Returns:
+            Executable Polars expression string
+        """
+        dimensions = dimensions or []
+        
+        # Non-ratio metrics (MEAN, SUM, GROWTH)
+        if not denominator:
+            return self.FORMULA_TEMPLATES["MEAN"](numerator)
+        
+        # Ratio metrics
+        if scope == "SAME_ROW":
+            formula = self.FORMULA_TEMPLATES["SAME_ROW"](numerator, denominator)
+        elif scope == "GLOBAL_SUM":
+            formula = self.FORMULA_TEMPLATES["GLOBAL_SUM"](numerator, denominator)
+        elif scope == "GROUP_SUM" and dimensions:
+            formula = self.FORMULA_TEMPLATES["GROUP_SUM"](numerator, denominator, dimensions)
+        elif scope == "DIMENSIONAL":
+            formula = self.FORMULA_TEMPLATES["DIMENSIONAL"](numerator, denominator)
+        else:
+            # Default to SAME_ROW if scope not recognized
+            logger.warning(f"Unknown scope '{scope}', defaulting to SAME_ROW")
+            formula = self.FORMULA_TEMPLATES["SAME_ROW"](numerator, denominator)
+        
+        # Add zero-division protection
+        formula = self._add_zero_protection(formula, denominator)
+        
+        return formula
+    
+    def _add_zero_protection(self, formula: str, denominator: str) -> str:
+        """Add null-if-zero protection to prevent division by zero."""
+        # Wrap denominator in replace(0, None) to convert zeros to nulls
+        protected_den = f"pl.col('{denominator}').replace(0, None)"
+        formula = formula.replace(f"pl.col('{denominator}')", protected_den)
+        return formula
+    
+    def apply_guardrail(self, col_name: str, guardrail_transformation: str) -> str:
+        """
+        Apply guardrail transformation to column.
+        
+        Args:
+            col_name: Physical column name
+            guardrail_transformation: Transformation formula (e.g., "INVERT(our_position) = (16 - our_position)")
+        
+        Returns:
+            Transformed column expression
+        """
+        if not guardrail_transformation:
+            return f"pl.col('{col_name}')"
+        
+        # Parse transformation
+        if "INVERT" in guardrail_transformation:
+            # Extract formula: "INVERT(our_position) = (16 - our_position)"
+            match = re.search(r'=\s*\(([^)]+)\)', guardrail_transformation)
+            if match:
+                transform = match.group(1)
+                # Replace column name with pl.col() syntax
+                transform = transform.replace(col_name, f"pl.col('{col_name}')")
+                return f"({transform})"
+        
+        elif "FILTER" in guardrail_transformation:
+            # Data quality filter - apply as filter, not transformation
+            return f"pl.col('{col_name}')"
+        
+        # Default: no transformation
+        return f"pl.col('{col_name}')"
+
+
+# ============================================================================
+# AUTONOMOUS METRIC RESOLVER
+# ============================================================================
 
 class MetricResolver:
-    """Resolves abstract business metrics to concrete columns using Blueprints."""
+    """
+    100% Autonomous Metric Resolver.
     
-    def __init__(self, profile: SemanticProfile, llm_client=None):
+    Converts business concepts to executable Polars expressions using:
+    - Semantic column mapping (not hardcoded synonyms)
+    - Dynamic formula generation
+    - Type safety validation
+    - Guardrail injection
+    """
+    
+    def __init__(self, profile: SemanticProfile, df: pl.DataFrame):
+        """
+        Initialize resolver with semantic profile and dataset.
+        
+        Args:
+            profile: Semantic profile from Phase 0.3
+            df: Polars DataFrame to execute against
+        """
         self.profile = profile
-        self.llm_client = llm_client  # For dynamic LLM-driven resolution
-        
-    def resolve_metric(self, business_metric: str, required_roles: List[str]) -> ResolutionResult:
-        """
-        Main entry point for resolution.
-        """
-        logger.info(f"Resolving metric: '{business_metric}' (roles: {required_roles})")
-        
-        # 1. Classify Intent (The Blueprint)
-        blueprint = BlueprintClassifier.classify(business_metric, required_roles)
-        logger.info(f"Blueprint: {blueprint.metric_type} -> primary='{blueprint.primary_concept}', sec='{blueprint.secondary_concept}'")
-        
-        # 2. Branch by Type
-        if blueprint.metric_type == MetricType.DIRECT:
-            return self._resolve_direct(blueprint.primary_concept, required_roles)
-            
-        elif blueprint.metric_type == MetricType.RATIO:
-            return self._resolve_ratio(blueprint, required_roles)
-            
-        elif blueprint.metric_type == MetricType.RATE:
-            # Treat rates like ratios or direct % columns
-            # Try direct first (e.g. "Conversion Rate" column), then ratio
-            direct = self._resolve_direct(blueprint.primary_concept, required_roles)
-            if direct.resolution_confidence > 0.7:
-                 return direct
-            return self._resolve_ratio(blueprint, required_roles)
-            
-        elif blueprint.metric_type == MetricType.EFFICIENCY:
-            # Efficiency is usually a ratio
-            return self._resolve_ratio(blueprint, required_roles)
-
-        elif blueprint.metric_type == MetricType.FUNNEL:
-             return self._resolve_funnel(blueprint, required_roles)
-             
-        elif blueprint.metric_type == MetricType.INVENTORY:
-             return self._resolve_inventory(blueprint, required_roles) # Placeholder
-             
-        elif blueprint.metric_type == MetricType.TEMPORAL:
-             # Temporal metrics usually need a base metric + time
-             # We resolve the base metric
-             base_res = self._resolve_direct(blueprint.primary_concept, required_roles)
-             if base_res.resolution_confidence > 0.6:
-                 # We return the base metric but note it's for temporal analysis
-                 base_res.explanation += " (Base for Temporal Analysis)"
-                 return base_res
-             return self._resolve_unsupported(blueprint, "Could not resolve base metric for temporal analysis")
-
-        # Fallback to direct
-        return self._resolve_direct(blueprint.primary_concept, required_roles)
-
-    def _resolve_direct(self, intent: str, required_roles: List[str]) -> ResolutionResult:
-        """Find best existing column matching intent and roles."""
-        candidates = []
-        intent_lower = intent.lower()
-        
-        # Apply synonym expansion
-        search_terms = [intent_lower]
-        for synonym_key, synonyms in METRIC_SYNONYMS.items():
-            if synonym_key in intent_lower:
-                search_terms.extend(synonyms)
-            elif intent_lower in synonyms:
-                search_terms.append(synonym_key)
-                search_terms.extend([s for s in synonyms if s != intent_lower])
-        
-        # Check against registry first? No, blueprint covers that?
-        # Maybe "Profit" is in registry as Sales - Cost?
-        # If direct resolution fails, we could try registry lookup as fallback.
-        
-        candidates = self._find_candidates(intent_lower, required_roles)
-        
-        # Sort by score desc
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        
-        if not candidates:
-             # Try registry fallback if direct failed
-            registry_res = self._resolve_from_registry(intent)
-            if registry_res.resolution_confidence > 0.6:
-                return registry_res
-            
-            # Final fallback: LLM-driven resolution
-            if self.llm_client:
-                logger.info(f"Static resolution failed for '{intent}', trying LLM...")
-                return self._resolve_with_llm(intent, required_roles)
-                
-            return ResolutionResult(None, 0.0, "failed", [], f"No direct candidates found for '{intent}'")
-            
-        best_score, best_entity, best_reasons = candidates[0]
-        
-        # Thresholds
-        if best_score < 0.4:
-            return ResolutionResult(None, 0.0, "failed", [], f"Best match '{best_entity.column_name}' confidence too low ({best_score:.2f})")
-            
-        return ResolutionResult(
-            resolved_metric=best_entity.column_name,
-            resolution_confidence=min(1.0, best_score),
-            resolution_type="direct",
-            dependencies=[best_entity.column_name],
-            explanation=f"Selected '{best_entity.column_name}': {', '.join(best_reasons)}"
-        )
-        
-    def _resolve_ratio(self, blueprint: MetricBlueprint, roles: List[str]) -> ResolutionResult:
-        """Resolve A / B."""
-        num_concept = blueprint.primary_concept
-        den_concept = blueprint.secondary_concept or "total" # Default?
-        
-        # If secondary is "context_dependent" (generic ratio), we can't resolve without more info
-        if den_concept == "context_dependent":
-             return self._resolve_unsupported(blueprint, "Context dependent ratio denominator")
-             
-        # Resolve Numerator
-        num_res = self._resolve_direct(num_concept, []) # Loose roles
-        if num_res.resolution_confidence < 0.5:
-             return self._resolve_unsupported(blueprint, f"Could not resolve numerator '{num_concept}'")
-             
-        # Resolve Denominator
-        den_res = self._resolve_direct(den_concept, [])
-        if den_res.resolution_confidence < 0.5:
-              return self._resolve_unsupported(blueprint, f"Could not resolve denominator '{den_concept}'")
-              
-        return ResolutionResult(
-            resolved_metric=f"({num_res.resolved_metric} / {den_res.resolved_metric})", # Virtual
-            resolution_confidence=num_res.resolution_confidence * den_res.resolution_confidence,
-            resolution_type="derived",
-            dependencies=[num_res.resolved_metric, den_res.resolved_metric],
-            explanation=f"Ratio: {num_res.explanation} / {den_res.explanation}",
-            formula_name="dynamic_ratio"
-        )
-
-    def _resolve_funnel(self, blueprint: MetricBlueprint, roles: List[str]) -> ResolutionResult:
-        """Check for ordered funnel stages."""
-        # Find columns with 'funnel' role
-        funnel_cols = []
-        for entity in self.profile.entities:
-            if entity.semantic_guess == "funnel" and entity.confidence > 0.4:
-                funnel_cols.append(entity)
-        
-        if len(funnel_cols) < 2:
-             return self._resolve_unsupported(blueprint, "Insufficient funnel stages found (need 2+)")
-             
-        # Sort by value count? Or name? Hard to know order without manual input.
-        # Ensure we have at least 'funnel' role.
-        
-        return ResolutionResult(
-            resolved_metric="funnel_analysis",
-            resolution_confidence=0.7,
-            resolution_type="derived",
-            dependencies=[c.column_name for c in funnel_cols],
-            explanation=f"Found {len(funnel_cols)} funnel stages: {[c.column_name for c in funnel_cols]}",
-            formula_name="funnel_projection"
-        )
-        
-    def _resolve_inventory(self, blueprint: MetricBlueprint, roles: List[str]) -> ResolutionResult:
-        # Require 'inventory' role + time
-        inv_cols = [e for e in self.profile.entities if e.semantic_guess == "inventory"]
-        if not inv_cols:
-             return self._resolve_unsupported(blueprint, "No inventory columns found")
-             
-        return self._resolve_direct(blueprint.primary_concept, roles) # Fallback to direct lookup of "Turnover" etc
-
-    def _resolve_unsupported(self, blueprint: MetricBlueprint, reason: str) -> ResolutionResult:
-        return ResolutionResult(
-            resolved_metric=None,
-            resolution_confidence=0.0,
-            resolution_type="unsupported",
-            dependencies=[],
-            explanation=f"Unsupported {blueprint.metric_type}: {reason}"
-        )
-        
-    def _find_candidates(self, intent: str, required_roles: List[str]) -> List[tuple]:
-        """Core scoring logic."""
-        candidates = []
-        intent_lower = intent.lower()
-        
-        for entity in self.profile.entities:
-            # Strict Type Check: Only Numeric or Boolean
-            if entity.statistical_type not in ["numeric", "boolean"]:
-                continue
-                
-            score = 0.0
-            reasons = []
-            
-            # 1. Semantic Role Check
-            # If required_roles are present, entity MUST match or be neutral?
-            # User said: "Code resolves data. Validation enforces truth."
-            if required_roles:
-                # Standardize roles for comparison
-                normalized_roles = [r.lower().replace(" ", "").replace("_", "") for r in required_roles]
-                entity_role = entity.semantic_guess.lower().replace(" ", "").replace("_", "")
-                
-                # Check for direct or partial match
-                if any(entity_role in role_name or role_name in entity_role for role_name in normalized_roles):
-                    score += 0.4
-                    reasons.append(f"Role match ({entity.semantic_guess})")
-                else:
-                    if entity.confidence > 0.6:
-                         score -= 0.2
-            else:
-                score += 0.1
-                
-            # 2. Keyword Match
-            col_lower = entity.column_name.lower()
-            if intent_lower == col_lower:
-                score += 0.6
-                reasons.append("Exact match")
-            elif intent_lower in col_lower: # "profit" in "gross_profit_margin"
-                # Check for negation (e.g. asking for "profit" but col is "profit_margin" which is ratio?)
-                # This is solved by Blueprint (Ratio vs Direct).
-                score += 0.4
-                reasons.append("Partial match")
-            elif any(part in col_lower for part in intent_lower.split()):
-                score += 0.2
-                reasons.append("Token match")
-                
-            # 3. Quality
-            if entity.null_percentage < 5:
-                score += 0.05
-                
-            # 4. Semantic Confidence
-            score *= entity.confidence
-            
-            if score > 0.3:
-                candidates.append((score, entity, reasons))
-            else:
-                if intent_lower in col_lower:
-                    logger.debug(f"  Column '{entity.column_name}' score {score:.2f} too low for intent '{intent}' (reasons: {reasons})")
-        
-        return candidates
+        self.df = df
+        self.formula_builder = PolarsFormulaBuilder()
     
-    def _resolve_with_llm(self, business_metric: str, required_roles: List[str]) -> ResolutionResult:
-        """Use LLM to intelligently map abstract metric to available columns."""
+    def resolve_hypothesis(self, hypothesis: Hypothesis) -> ExecutionPlan:
+        """
+        Main entry point: Convert hypothesis to execution plan.
         
-        # Prepare column metadata for LLM
-        columns_info = []
-        for entity in self.profile.entities:
-            col_info = {
-                "name": entity.column_name,
-                "type": entity.statistical_type,
-                "role": entity.semantic_guess,
-                "confidence": round(entity.confidence, 2)
-            }
-            columns_info.append(col_info)
+        Steps:
+        1. Find real columns for numerator/denominator
+        2. Validate types
+        3. Build Polars formula
+        4. Apply guardrails
+        5. Return execution plan
         
-        prompt = f"""You are a data analyst mapping business metrics to dataset columns.
-
-Business Metric: "{business_metric}"
-Required Semantic Roles: {required_roles}
-
-Available Columns:
-{json.dumps(columns_info, indent=2)}
-
-Task: Determine how to calculate this metric from available columns.
-
-Response Format (JSON only, no markdown):
-{{
-  "mapping_type": "direct|derived|impossible",
-  "explanation": "Brief reasoning",
-  "confidence": 0.0-1.0,
-  "target_column": "column_name" (if direct),
-  "formula": "Sales - Cost" (if derived),
-  "dependencies": ["col1", "col2"] (if derived)
-}}
-
-Rules:
-1. Prefer DIRECT if column name clearly matches (e.g., Revenue→Sales)
-2. Use DERIVED for calculations (e.g., Profitability→Sales-Cost)
-3. Return IMPOSSIBLE only if truly no way to calculate
-4. Common mappings: Revenue→Sales, Profitability→(Price-Cost), Growth→(Current-Previous)/Previous"""
+        Args:
+            hypothesis: Hypothesis from Phase 1
         
-        try:
-            response = self.llm_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",  # Fixed: removed groq/ prefix
-                messages=[
-                    {"role": "system", "content": "You are a data mapping expert. Always respond with valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2,
-                max_tokens=500
+        Returns:
+            ExecutionPlan with validated formula
+        
+        Raises:
+            ValueError: If column mapping or validation fails
+        """
+        logger.info(f"Resolving hypothesis: {hypothesis.title}")
+        
+        # Step 1: Column mapping
+        num_col, num_method, num_confidence = self._find_column_by_concept(
+            hypothesis.numerator_concept
+        )
+        
+        if not num_col:
+            raise ValueError(f"Could not find column for numerator concept: {hypothesis.numerator_concept}")
+        
+        den_col = None
+        den_method = "none"
+        den_confidence = 1.0
+        
+        if hypothesis.denominator_concept:
+            den_col, den_method, den_confidence = self._find_column_by_concept(
+                hypothesis.denominator_concept
             )
+            if not den_col:
+                raise ValueError(f"Could not find column for denominator concept: {hypothesis.denominator_concept}")
+        
+        # Step 2: Type validation
+        if not self._validate_column_types(num_col, den_col):
+            raise ValueError(f"Type validation failed for {hypothesis.id}")
+        
+        # Step 3: Apply guardrails to columns
+        num_expr = num_col
+        den_expr = den_col
+        
+        if hypothesis.guardrail_transformation:
+            # Check if guardrail applies to numerator or denominator
+            if hypothesis.guardrail_applied and hypothesis.guardrail_applied in num_col:
+                num_expr = self.formula_builder.apply_guardrail(num_col, hypothesis.guardrail_transformation)
+            elif hypothesis.guardrail_applied and den_col and hypothesis.guardrail_applied in den_col:
+                den_expr = self.formula_builder.apply_guardrail(den_col, hypothesis.guardrail_transformation)
+        
+        # Step 4: Build formula
+        formula = self.formula_builder.build_ratio_formula(
+            numerator=num_col,
+            denominator=den_col,
+            scope=hypothesis.denominator_scope,
+            dimensions=hypothesis.dimensions
+        )
+        
+        # Step 5: Create execution plan
+        resolution_confidence = min(num_confidence, den_confidence) if den_col else num_confidence
+        
+        return ExecutionPlan(
+            hypothesis_id=hypothesis.id,
+            numerator_column=num_col,
+            denominator_column=den_col,
+            polars_expression=formula,
+            aggregation_scope=hypothesis.aggregation_scope,
+            time_grain=hypothesis.time_grain,
+            dimensions=hypothesis.dimensions,
+            type_safe=True,
+            has_guardrails=bool(hypothesis.guardrail_transformation),
+            null_safe=True,  # Zero-division protection added
+            resolution_method=num_method,
+            resolution_confidence=resolution_confidence,
+            hypothesis_title=hypothesis.title,
+            lens_name=hypothesis.lens
+        )
+    
+    def _find_column_by_concept(self, concept: str) -> Tuple[Optional[str], str, float]:
+        """
+        Find physical column for business concept using semantic matching.
+        
+        Priority:
+        1. Exact name match (case-insensitive)
+        2. Semantic role match
+        3. Fuzzy/similarity match
+        
+        Args:
+            concept: Business concept (e.g., "revenue", "sales", "efficiency")
+        
+        Returns:
+            Tuple of (column_name, method, confidence)
+        """
+        concept_lower = concept.lower().strip()
+        
+        # Priority 1: Exact match
+        for col in self.df.columns:
+            if col.lower() == concept_lower:
+                logger.info(f"Exact match: '{concept}' → '{col}'")
+                return col, "exact", 1.0
+        
+        # Priority 2: Semantic match
+        semantic_match = self._semantic_match(concept)
+        if semantic_match:
+            col, confidence = semantic_match
+            logger.info(f"Semantic match: '{concept}' → '{col}' (confidence: {confidence:.2f})")
+            return col, "semantic", confidence
+        
+        # Priority 3: Fuzzy match
+        fuzzy_match = self._fuzzy_match(concept)
+        if fuzzy_match:
+            col, confidence = fuzzy_match
+            logger.info(f"Fuzzy match: '{concept}' → '{col}' (confidence: {confidence:.2f})")
+            return col, "fuzzy", confidence
+        
+        logger.error(f"No match found for concept: '{concept}'")
+        return None, "failed", 0.0
+    
+    def _semantic_match(self, concept: str) -> Optional[Tuple[str, float]]:
+        """
+        Find column by semantic role.
+        
+        Example: "revenue" matches column with semantic_role="financial"
+        """
+        concept_lower = concept.lower()
+        
+        # Semantic role keywords
+        role_keywords = {
+            "financial": ["revenue", "sales", "income", "profit", "cost", "price", "margin"],
+            "funnel": ["clicks", "impressions", "conversions", "leads", "visits"],
+            "temporal": ["date", "time", "timestamp", "period", "month", "week"],
+            "identifier": ["id", "key", "code", "number"],
+            "categorical": ["category", "type", "class", "group", "segment"]
+        }
+        
+        # Find which role this concept belongs to
+        target_role = None
+        for role, keywords in role_keywords.items():
+            if any(kw in concept_lower for kw in keywords):
+                target_role = role
+                break
+        
+        if not target_role:
+            return None
+        
+        # Search for columns with matching semantic role
+        for entity in self.profile.entities:
+            if hasattr(entity, 'columns'):
+                for col_obj in entity.columns:
+                    if col_obj.semantic_role == target_role:
+                        # Check if column exists in dataframe
+                        if col_obj.name in self.df.columns:
+                            return col_obj.name, 0.8
+        
+        return None
+    
+    def _fuzzy_match(self, concept: str) -> Optional[Tuple[str, float]]:
+        """
+        Find column by string similarity (last resort).
+        
+        Uses simple substring matching.
+        """
+        concept_lower = concept.lower()
+        best_match = None
+        best_score = 0.0
+        
+        for col in self.df.columns:
+            col_lower = col.lower()
             
-            content = response.choices[0].message.content.strip()
-            
-            # Remove markdown code blocks if present
-            if content.startswith('```'):
-                content = content.split('```')[1]
-                if content.startswith('json'):
-                    content = content[4:]
-                content = content.strip()
-            
-            result = json.loads(content)
-            logger.info(f"LLM resolution result: {result}")
-            
-            # Validate and construct ResolutionResult
-            if result["mapping_type"] == "direct":
-                target = result.get("target_column")
-                
-                # Validate column exists
-                available_cols = [e.column_name for e in self.profile.entities]
-                if target not in available_cols:
-                    logger.warning(f"LLM suggested non-existent column: {target}")
-                    return ResolutionResult(None, 0.0, "failed", [], f"LLM suggested invalid column: {target}")
-                
-                return ResolutionResult(
-                    resolved_metric=target,
-                    resolution_confidence=min(1.0, result["confidence"]),
-                    resolution_type="direct",
-                    dependencies=[],
-                    explanation=f"LLM: {result['explanation']}"
-                )
-                
-            elif result["mapping_type"] == "derived":
-                deps = result.get("dependencies", [])
-                
-                # Validate dependencies exist
-                available_cols = [e.column_name for e in self.profile.entities]
-                for dep in deps:
-                    if dep not in available_cols:
-                        logger.warning(f"LLM suggested non-existent dependency: {dep}")
-                        return ResolutionResult(None, 0.0, "failed", [], f"Missing dependency: {dep}")
-                
-                return ResolutionResult(
-                    resolved_metric=f"derived_{business_metric.lower().replace(' ', '_')}",
-                    resolution_confidence=min(1.0, result["confidence"]),
-                    resolution_type="derived",
-                    dependencies=deps,
-                    explanation=f"LLM: {result['explanation']}",
-                    formula_name=result.get("formula", "custom")
-                )
-            else:
-                return ResolutionResult(
-                    None, 0.0, "failed", [],
-                    f"LLM: {result.get('explanation', 'Cannot calculate this metric')}"
-                )
-                
-        except json.JSONDecodeError as e:
-            logger.error(f"LLM returned invalid JSON: {e}")
-            return ResolutionResult(None, 0.0, "failed", [], f"LLM JSON parse error: {str(e)}")
-        except Exception as e:
-            logger.error(f"LLM resolution error: {e}")
-            return ResolutionResult(None, 0.0, "failed", [], f"LLM error: {str(e)}")
-
-    def _resolve_from_registry(self, intent: str) -> ResolutionResult:
-         # Reuse old derived logic
-         # ... (Implementation of registry lookup)
-         # For brevity, implementing a stub that checks existing registry
-         metric_def = get_derived_metric(intent)
-         if not metric_def:
-             return ResolutionResult(None, 0.0, "failed", [], "")
-             
-         # Verify ingredients... (Simplified version of old logic)
-         # In a real implementation, I'd copy the logic. 
-         # Assuming I can't reuse the old method purely because I replaced the class.
-         # So I will re-implement minimal registry lookup here.
-         
-         # For checking ingredients, revert to simple find
-         ingredients = []
-         missing = []
-         for i, keywords in enumerate(metric_def.required_keywords):
-              # Try to find best match
-              best = None
-              best_s = 0
-              for entity in self.profile.entities:
-                   s = 0
-                   if any(k in entity.column_name.lower() for k in keywords):
-                        s = 0.8
-                   if entity.semantic_guess == metric_def.required_roles[i]:
-                        s += 0.2
-                   if s > best_s:
-                        best_s = s
-                        best = entity.column_name
-              
-              if best and best_s > 0.5:
-                   ingredients.append(best)
-              else:
-                   missing.append(f"ingredient {i}")
-         
-         if missing:
-              return ResolutionResult(None, 0.0, "failed", [], f"Missing {missing}")
-              
-         return ResolutionResult(
-             resolved_metric=f"derived_{intent.replace(' ','_')}",
-             resolution_confidence=0.8,
-             resolution_type="derived",
-             dependencies=ingredients,
-             explanation=f"Found derived formula for {intent}",
-             formula_name=intent
-         )
+            # Substring match
+            if concept_lower in col_lower or col_lower in concept_lower:
+                score = len(concept_lower) / max(len(concept_lower), len(col_lower))
+                if score > best_score:
+                    best_score = score
+                    best_match = col
+        
+        if best_match and best_score >= 0.5:
+            return best_match, best_score
+        
+        return None
+    
+    def _validate_column_types(self, num_col: str, den_col: Optional[str]) -> bool:
+        """
+        Validate columns are numeric and suitable for math.
+        
+        Args:
+            num_col: Numerator column name
+            den_col: Denominator column name (optional)
+        
+        Returns:
+            True if valid, False otherwise
+        """
+        # Check numerator is numeric
+        if not self.df[num_col].dtype.is_numeric():
+            logger.error(f"Numerator '{num_col}' is not numeric: {self.df[num_col].dtype}")
+            return False
+        
+        # Check denominator is numeric (if exists)
+        if den_col and not self.df[den_col].dtype.is_numeric():
+            logger.error(f"Denominator '{den_col}' is not numeric: {self.df[den_col].dtype}")
+            return False
+        
+        # Check null percentage
+        null_pct = self.df[num_col].null_count() / len(self.df)
+        if null_pct > 0.7:
+            logger.warning(f"Column '{num_col}' is {null_pct*100:.1f}% null (high)")
+            return False
+        
+        logger.info(f"Type validation passed: {num_col}" + (f", {den_col}" if den_col else ""))
+        return True

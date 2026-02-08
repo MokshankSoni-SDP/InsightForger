@@ -189,6 +189,7 @@ class ContextInjector:
     """Uses LLM to infer business context with intelligent column selection and validation."""
     
     def __init__(self, token_tracker=None):
+        # Use primary GROQ_API_KEY for Phase 0.5 (rate limit distribution)
         self.api_key = os.getenv("GROQ_API_KEY")
         self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self.token_tracker = token_tracker

@@ -63,7 +63,15 @@ class LensAgent:
         self.guardrails = guardrails
         self.df = df
         
-        self.api_key = os.getenv("GROQ_API_KEY")
+        # Use GROQ_API_KEY_2 for Phase 1 (rate limit distribution)
+        self.api_key = os.getenv("GROQ_API_KEY_2")
+        if not self.api_key:
+            logger.warning("GROQ_API_KEY_2 not found, falling back to GROQ_API_KEY_3")
+            self.api_key = os.getenv("GROQ_API_KEY_3")
+            if not self.api_key:
+                logger.error("GROQ_API_KEY_3 also not found! Please set at least one API key.")
+                raise ValueError("No valid Groq API key found for Phase 1")
+        
         self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self.client = Groq(api_key=self.api_key)
         
