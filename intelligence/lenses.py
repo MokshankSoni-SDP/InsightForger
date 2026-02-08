@@ -78,15 +78,20 @@ class LensAgent:
         # Calculate hypothesis budget based on priority
         self.hypothesis_budget = self._calculate_hypothesis_budget()
         
+        # Safety fallback state
+        self.correction_notes = None  # Will be set if retry is needed
+        self.retry_count = 0
+        self.max_retries = 1  # Only retry once
+        
         logger.info(
             f"Initialized {self.lens_rec.lens_name} Agent "
             f"(Priority {self.lens_rec.priority}, Budget: {self.hypothesis_budget} hypotheses)"
         )
     
     def _calculate_hypothesis_budget(self) -> int:
-        """Calculate number of hypotheses based on priority."""
-        budget_map = {1: 6, 2: 5, 3: 3, 4: 2}
-        return budget_map.get(self.lens_rec.priority, 1)
+        """Calculate number of hypotheses based on priority (INCREASED BUDGET)."""
+        budget_map = {1: 10, 2: 8, 3: 5, 4: 3}
+        return budget_map.get(self.lens_rec.priority, 2)
     
     def _generate_diverse_sample(self) -> List[Dict[str, Any]]:
         """
@@ -148,6 +153,7 @@ class LensAgent:
         
         lines = []
         
+        # UPGRADE 1: LITERAL NAME LAW - Make column names explicit
         for col in self.lens_rec.supporting_columns:
             if col not in df_pd.columns:
                 continue
@@ -158,15 +164,9 @@ class LensAgent:
             # Get semantic role from profile
             semantic_role = "unknown"
             for entity in self.profile.entities:
-                # EntityProfile has 'name' and list of column names, not column objects
-                if hasattr(entity, 'column_names') and col in entity.column_names:
-                    # Try to find in the profile's column metadata
-                    for prof_entity in self.profile.entities:
-                        if hasattr(prof_entity, 'columns'):
-                            for col_obj in prof_entity.columns:
-                                if col_obj.name == col:
-                                    semantic_role = col_obj.semantic_role
-                                    break
+                if hasattr(entity, 'column_name') and entity.column_name == col:
+                    if hasattr(entity, 'semantic_guess'):
+                        semantic_role = entity.semantic_guess
                     break
             
             # Get stats
@@ -188,7 +188,8 @@ class LensAgent:
                         guardrail_note = " ⚠️ INVERTED RANK"
                     break
             
-            lines.append(f"- {col} ({dtype} - {semantic_role}){stats_str}{guardrail_note}")
+            # UPGRADE 1: Use EXACT_KEY format to enforce literal names
+            lines.append(f"- EXACT_KEY: \"{col}\" (Type: {dtype}, Role: {semantic_role}){stats_str}{guardrail_note}")
         
         return "\n".join(lines)
     
@@ -222,72 +223,90 @@ class LensAgent:
         """
         Build Level 10 system prompt with rich context.
         """
-        # Get temporal behavior
-        temporal_info = ""
+        # UPGRADE 2: GHOST COLUMN BAN - Build temporal warning
+        temporal_warning = ""
         if self.business_context.temporal_behavior:
-            tb = self.business_context.temporal_behavior
-            temporal_info = f"""
-TEMPORAL GUIDANCE:
-- Primary Periodicity: {tb.primary_periodicity}
-- Rationale: {tb.rationale}
-- Critical Slices: {', '.join(tb.critical_slices)}
-- Seasonality Expected: {tb.seasonality_expected}
-"""
+            if hasattr(self.business_context.temporal_behavior, 'critical_slices'):
+                temporal_warning = "\n\nCRITICAL SLICES (Future Intents - DO NOT USE as dimensions):\n"
+                for slice_name in self.business_context.temporal_behavior.critical_slices:
+                    temporal_warning += f"- {slice_name} (will be engineered in Phase 4, not available now)\n"
+        
+        # SAFETY FALLBACK: Add correction notes if this is a retry
+        correction_section = ""
+        if self.correction_notes:
+            correction_section = f"""\n\n=== CORRECTION FROM PREVIOUS ATTEMPT ===
+[CRITICAL] Your previous hypotheses had errors. Here's what went wrong:
+{self.correction_notes}
+
+Please generate NEW hypotheses that avoid these mistakes!
+==================================\n\n"""
+        
+        column_metadata = self._build_column_metadata()
+        guardrail_str = self._format_guardrails()
         
         return f"""You are the {self.lens_rec.lens_name} Agent - a Level 10 Analytical Intelligence system.
-
+{correction_section}
 STRATEGIC OBJECTIVE (from Phase 0.5):
 {self.lens_rec.objective}
 
 Every hypothesis you generate MUST serve this specific goal and find "hidden money," not just repeat column headers.
 
 AVAILABLE COLUMNS (supporting this lens):
-{self._build_column_metadata()}
-
+{column_metadata}
+{temporal_warning}
 DATASET LAWS & GUARDRAILS:
-{self._format_guardrails()}
-{temporal_info}
+{guardrail_str}
+
+TEMPORAL GUIDANCE:
+- Primary Periodicity: {self.business_context.temporal_behavior.primary_periodicity if self.business_context.temporal_behavior else 'Unknown'}
+- Seasonality Expected: {self.business_context.temporal_behavior.seasonality_expected if self.business_context.temporal_behavior else 'Unknown'}
+
+=== THE LITERAL NAME LAW ===
+[CRITICAL] You are STRICTLY FORBIDDEN from changing column name casing!
+- If the column is "Category", you MUST write "Category" (not "category")
+- If the column is "Our_Position", you MUST write "Our_Position" (not "our_position")
+- Use ONLY the EXACT_KEY names from AVAILABLE COLUMNS above
+- Do NOT use Critical Slices as dimensions - they don't exist yet!
 
 CRITICAL RULES FOR LEVEL 10 INTELLIGENCE:
 
 1. DENOMINATOR PRECISION (Flaw G Fix):
-   When creating a RATIO, specify denominator_scope:
-   
-   - SAME_ROW: Different column in same row
-     Example: sales / adcost (efficiency per transaction)
-   
-   - GLOBAL_SUM: Sum of column for entire dataset
-     Example: sales / SUM(sales) (market share)
-   
-   - GROUP_SUM: Sum for specific group
-     Example: sales / category_sales (category share)
-   
-   ❌ WRONG: numerator="sales", denominator="sales", scope=SAME_ROW (this equals 1!)
+   ❌ WRONG: numerator="sales", denominator="sales", scope=SAME_ROW (equals 1!)
    ✅ RIGHT: numerator="sales", denominator="sales", scope=GLOBAL_SUM (market share)
 
 2. CROSS-METRIC HYPOTHESES (Flaw H Fix):
-   Do NOT generate basic descriptive statistics like "Average sales by category."
-   
    ❌ WRONG: "Average sales by category" (boring reporting)
-   ✅ RIGHT: "Is ROAS higher for Formal Shoes at Position 1 vs Running Shoes at Position 3?" (diagnostic)
-   
-   Always compare a Cost Measure (adcost, price) to a Success Measure (sales, clicks).
+   ✅ RIGHT: "Is ROAS higher for Formal Shoes at Position 1 vs Running Shoes at Position 3?"
 
-3. MULTI-DIMENSIONAL ENFORCEMENT (Flaw H Fix):
-   Priority 1 hypotheses MUST involve at least 2 dimensions to find deep segments.
-   
-   ❌ WRONG: MEAN(sales) by category (1 dimension)
-   ✅ RIGHT: MEAN(sales) by category AND our_position (2 dimensions)
+3. MULTI-DIMENSIONAL ENFORCEMENT:
+   Priority 1 hypotheses MUST involve at least 2 dimensions
 
-4. EXPLICIT GUARDRAIL TRANSFORMATIONS (Flaw I Fix):
-   If using a column with a guardrail, specify the exact mathematical transformation.
-   
-   Example: If our_position has inverted_rank guardrail:
-   - Set guardrail_applied: "inverted_rank"
-   - Set guardrail_transformation: "INVERT(our_position) = (11 - our_position)"
+4. EXPLICIT GUARDRAIL TRANSFORMATIONS:
+   Set guardrail_transformation: "INVERT(our_position) = (11 - our_position)"
 
-5. NO "TOTAL" KEYWORD:
-   Never use "total" as a denominator. Use aggregation_scope instead.
+5. CROSS-METRIC PAIRING (NEW):
+   Try combining every Success Metric (Sales, Clicks, Conversions) with at least TWO different Cost Metrics (AdCost, Price, Cost) to uncover different friction points.
+   Example: Sales/AdCost (ROAS), Sales/Price (Price Efficiency), Sales/Cost (Margin Efficiency)
+
+6. DIMENSION PERMUTATION (For Priority 1 Lenses):
+   Generate one hypothesis for EACH unique categorical dimension available.
+   Example: If you have Category, SubCategory, Brand → create separate hypotheses for each
+OUTPUT FORMAT:
+Return ONLY a JSON array of hypothesis objects. Each must have:
+- title: Brief diagnostic title
+- business_metric: Column name from AVAILABLE COLUMNS
+- aggregation_scope: GLOBAL | TEMPORAL | DIMENSIONAL
+- time_grain: "daily" | "weekly" | "monthly" (if TEMPORAL)
+- dimensions: List of EXACT column names from AVAILABLE COLUMNS
+- metric_template: RATIO | MEAN | SUM | GROWTH
+- numerator_concept: Business concept for numerator
+- denominator_concept: Business concept for denominator (if RATIO)
+- denominator_scope: SAME_ROW | GLOBAL_SUM | GROUP_SUM (if RATIO)
+- guardrail_applied: Column name if guardrail applies
+- guardrail_transformation: Exact formula if guardrail applies
+- description: Brief explanation
+- priority: 1-5 (1=critical, 5=exploratory)
+- confidence: 0.0-1.0
 """
     
     def _build_user_prompt(self, sample_data: List[Dict[str, Any]]) -> str:
@@ -334,6 +353,28 @@ CRITICAL VALIDATION:
 
 Return JSON array of exactly {self.hypothesis_budget} hypotheses, ordered by priority (highest first)."""
     
+    
+    def retry_with_corrections(self, correction_notes: str) -> List[Hypothesis]:
+        """
+        Retry hypothesis generation with correction notes about previous errors.
+        
+        Args:
+            correction_notes: Description of what went wrong (e.g., hallucinated columns)
+            
+        Returns:
+            List of corrected hypotheses
+        """
+        if self.retry_count >= self.max_retries:
+            logger.warning(f"{self.lens_rec.lens_name}: Max retries reached, cannot retry again")
+            return []
+        
+        logger.info(f"{self.lens_rec.lens_name}: Retrying with corrections...")
+        self.correction_notes = correction_notes
+        self.retry_count += 1
+        
+        # Generate new hypotheses with correction notes injected
+        return self.generate_hypotheses()
+    
     def generate_hypotheses(self) -> List[Hypothesis]:
         """Generate Level 10 hypotheses using rich context."""
         logger.info(f"{self.lens_rec.lens_name} generating {self.hypothesis_budget} Level 10 hypotheses")
@@ -360,6 +401,10 @@ Return JSON array of exactly {self.hypothesis_budget} hypotheses, ordered by pri
                 return []
             
             hypotheses = []
+            
+            # UPGRADE 3: CASE-SENSITIVITY REPAIRMAN - Build column name map
+            valid_cols = {c.lower(): c for c in self.df.columns}
+            
             for h in hypotheses_data[:self.hypothesis_budget]:
                 try:
                     # Validate required fields
@@ -367,6 +412,23 @@ Return JSON array of exactly {self.hypothesis_budget} hypotheses, ordered by pri
                     if not all(k in h for k in required):
                         logger.warning(f"Skipping hypothesis with missing fields: {h.get('title', 'Unknown')}")
                         continue
+                    
+                    # UPGRADE 3: Auto-repair dimension casing
+                    fixed_dimensions = []
+                    for dim in h.get('dimensions', []):
+                        if dim in self.df.columns:
+                            # Already perfect
+                            fixed_dimensions.append(dim)
+                        elif dim.lower() in valid_cols:
+                            # Auto-repair casing: 'category' -> 'Category'
+                            correct_name = valid_cols[dim.lower()]
+                            logger.info(f"Auto-repaired dimension: '{dim}' → '{correct_name}'")
+                            fixed_dimensions.append(correct_name)
+                        else:
+                            # It's a ghost column (like Is_Weekend), drop it
+                            logger.warning(f"Dropping ghost dimension '{dim}' from hypothesis: {h['title']}")
+                    
+                    h['dimensions'] = fixed_dimensions
                     
                     # Flaw G validation: Check for numerator==denominator trap
                     if h.get('denominator_concept') == h.get('numerator_concept'):

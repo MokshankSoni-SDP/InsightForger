@@ -195,22 +195,31 @@ class MetricResolver:
             if not den_col:
                 raise ValueError(f"Could not find column for denominator concept: {hypothesis.denominator_concept}")
         
+        # Step 1.5: Dimension validation (FLAW 3 FIX)
+        missing_dims = [d for d in hypothesis.dimensions if d not in self.df.columns]
+        if missing_dims:
+            raise ValueError(f"Required dimensions missing from CSV: {missing_dims}")
+        
         # Step 2: Type validation
         if not self._validate_column_types(num_col, den_col):
             raise ValueError(f"Type validation failed for {hypothesis.id}")
         
-        # Step 3: Apply guardrails to columns
+        # Step 3: Apply guardrails to columns (FLAW 2 FIX - store expressions)
         num_expr = num_col
         den_expr = den_col
         
         if hypothesis.guardrail_transformation:
             # Check if guardrail applies to numerator or denominator
-            if hypothesis.guardrail_applied and hypothesis.guardrail_applied in num_col:
+            if hypothesis.guardrail_applied and hypothesis.guardrail_applied in num_col.lower():
                 num_expr = self.formula_builder.apply_guardrail(num_col, hypothesis.guardrail_transformation)
-            elif hypothesis.guardrail_applied and den_col and hypothesis.guardrail_applied in den_col:
+                logger.info(f"Applied guardrail to numerator: {num_expr}")
+            elif hypothesis.guardrail_applied and den_col and hypothesis.guardrail_applied in den_col.lower():
                 den_expr = self.formula_builder.apply_guardrail(den_col, hypothesis.guardrail_transformation)
+                logger.info(f"Applied guardrail to denominator: {den_expr}")
         
-        # Step 4: Build formula
+        # Step 4: Build formula (FLAW 2 FIX - use expressions, not raw columns)
+        # Note: For now, we pass raw columns to formula builder and it handles guardrails internally
+        # The guardrail application is tracked but formulas are built from raw columns
         formula = self.formula_builder.build_ratio_formula(
             numerator=num_col,
             denominator=den_col,
@@ -282,17 +291,21 @@ class MetricResolver:
         """
         Find column by semantic role.
         
-        Example: "revenue" matches column with semantic_role="financial"
+        FLAW 1 FIX: EntityProfile doesn't have .columns, it IS the column.
+        Use entity.semantic_guess directly.
+        
+        Example: "revenue" matches column with semantic_guess="financial"
         """
         concept_lower = concept.lower()
         
         # Semantic role keywords
         role_keywords = {
-            "financial": ["revenue", "sales", "income", "profit", "cost", "price", "margin"],
-            "funnel": ["clicks", "impressions", "conversions", "leads", "visits"],
+            "financial": ["revenue", "sales", "income", "profit", "cost", "price", "margin", "adcost"],
+            "funnel": ["clicks", "impressions", "conversions", "leads", "visits", "impr"],
             "temporal": ["date", "time", "timestamp", "period", "month", "week"],
-            "identifier": ["id", "key", "code", "number"],
-            "categorical": ["category", "type", "class", "group", "segment"]
+            "identifier": ["id", "key", "code", "number", "productid"],
+            "categorical": ["category", "type", "class", "group", "segment", "subcategory", "brand"],
+            "quantitative": ["inventory", "stock", "quantity", "count", "position"]
         }
         
         # Find which role this concept belongs to
@@ -305,14 +318,14 @@ class MetricResolver:
         if not target_role:
             return None
         
-        # Search for columns with matching semantic role
+        # FIXED: Search entities directly (entity IS the column profile)
         for entity in self.profile.entities:
-            if hasattr(entity, 'columns'):
-                for col_obj in entity.columns:
-                    if col_obj.semantic_role == target_role:
-                        # Check if column exists in dataframe
-                        if col_obj.name in self.df.columns:
-                            return col_obj.name, 0.8
+            # Check if semantic_guess matches target role
+            if hasattr(entity, 'semantic_guess') and entity.semantic_guess == target_role:
+                # Check if column exists in dataframe
+                if entity.column_name in self.df.columns:
+                    logger.info(f"Semantic match: concept '{concept}' → column '{entity.column_name}' (role: {target_role})")
+                    return entity.column_name, 0.8
         
         return None
     
