@@ -1,0 +1,328 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Insight Report - 6_months_sells</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        header {
+            border-bottom: 3px solid #2c3e50;
+            padding-bottom: 20px;
+            margin-bottom: 30px;
+        }
+        
+        h1 {
+            color: #2c3e50;
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .meta {
+            color: #7f8c8d;
+            font-size: 0.95em;
+        }
+        
+        .context-box {
+            background: #ecf0f1;
+            padding: 20px;
+            border-left: 4px solid #3498db;
+            margin: 20px 0;
+        }
+        
+        .executive-summary {
+            background: #e8f5e9;
+            padding: 25px;
+            border-left: 4px solid #4caf50;
+            margin: 30px 0;
+            font-size: 1.1em;
+        }
+        
+        .insight-card {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 25px;
+            margin: 25px 0;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05);
+        }
+        
+        .insight-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        
+        .lens-badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+            color: white;
+        }
+        
+        .lens-CFO { background: #e74c3c; }
+        .lens-COO { background: #3498db; }
+        .lens-CMO { background: #9b59b6; }
+        
+        .confidence-badge {
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 0.8em;
+            font-weight: bold;
+        }
+        
+        .confidence-high { background: #2ecc71; color: white; }
+        .confidence-medium { background: #f39c12; color: white; }
+        .confidence-low { background: #95a5a6; color: white; }
+        
+        .insight-title {
+            font-size: 1.5em;
+            color: #2c3e50;
+            margin: 10px 0;
+        }
+        
+        .insight-section {
+            margin: 15px 0;
+        }
+        
+        .insight-section h4 {
+            color: #34495e;
+            margin-bottom: 8px;
+            font-size: 0.95em;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .insight-section p {
+            color: #555;
+            line-height: 1.7;
+        }
+        
+        /* Improvement #2: Key evidence styling */
+        .evidence-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 12px;
+            margin: 15px 0;
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 5px;
+        }
+        
+        .evidence-item {
+            text-align: center;
+        }
+        
+        .evidence-value {
+            font-size: 1.4em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .evidence-label {
+            font-size: 0.8em;
+            color: #7f8c8d;
+            margin-top: 3px;
+        }
+        
+        /* Improvement #1: Chart embedding */
+        .chart-container {
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .chart-container img {
+            max-width: 100%;
+            border-radius: 5px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+        }
+        
+        .stat-box {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 5px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        
+        .stat-label {
+            font-size: 0.85em;
+            color: #7f8c8d;
+           margin-top: 5px;
+        }
+        
+        /* Improvement #4: Methodology section */
+        .methodology-box {
+            background: #fff3cd;
+            padding: 20px;
+            border-left: 4px solid #ffc107;
+            margin: 30px 0;
+        }
+        
+        .methodology-box ul {
+            margin-left: 20px;
+            margin-top: 10px;
+        }
+        
+        .methodology-box li {
+            margin: 8px 0;
+            color: #555;
+        }
+        
+        /* Improvement #5: Metadata section */
+        .metadata-box {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+            font-size: 0.9em;
+        }
+        
+        .metadata-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        .metadata-item {
+            padding: 8px;
+            background: white;
+            border-radius: 3px;
+        }
+        
+        .metadata-label {
+            font-weight: bold;
+            color: #1976d2;
+        }
+        
+        footer {
+            border-top: 2px solid #ecf0f1;
+            padding-top: 20px;
+            margin-top: 40px;
+            text-align: center;
+            color: #95a5a6;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 Autonomous Insight Report</h1>
+            <div class="meta">
+                <strong>Dataset:</strong> 6_months_sells | 
+                <strong>Generated:</strong> 2026-02-07 19:30:12
+            </div>
+        </header>
+        
+        <!-- Improvement #5: Explicit Metadata -->
+        <div class="metadata-box">
+            <h3 style="margin-bottom: 10px; color: #1976d2;">📋 Report Metadata</h3>
+            <div class="metadata-grid">
+                <div class="metadata-item">
+                    <span class="metadata-label">Analysis Model:</span> groq/llama-3.1-70b-versatile
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Narration Model:</span> meta-llama/Meta-Llama-3-8B-Instruct
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Total Retries:</span> 0
+                </div>
+                <div class="metadata-item">
+                    <span class="metadata-label">Execution Time:</span> N/A
+                </div>
+            </div>
+        </div>
+        
+        <div class="context-box">
+            <h3>🏢 Business Context</h3>
+            <p><strong>Industry:</strong> General Business</p>
+            <p><strong>Business Type:</strong> Data Analysis</p>
+            <p><strong>Key KPIs:</strong> Revenue, Growth Rate, Efficiency</p>
+        </div>
+        
+        <div class="executive-summary">
+            <h3>📋 Executive Summary</h3>
+            <p>Analysis of Data Analysis data revealed 0 statistically validated insights across financial, operational, and marketing dimensions. 0 insights show high confidence and warrant immediate attention.</p>
+        </div>
+        
+        <div class="stats-grid">
+            <div class="stat-box">
+                <div class="stat-value">3</div>
+                <div class="stat-label">Hypotheses Tested</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Validated Insights</div>
+            </div>
+            <div class="stat-box">
+                <div class="stat-value">0</div>
+                <div class="stat-label">Rejected (Low Quality)</div>
+            </div>
+        </div>
+        
+        <h2 style="margin: 40px 0 20px; color: #2c3e50;">💡 Key Insights</h2>
+        <p style="color: #7f8c8d; margin-bottom: 20px;">Sorted by confidence (highest first)</p>
+        
+        
+        
+        <!-- Improvement #4: Methodology & Caveats -->
+        <div class="methodology-box">
+            <h3 style="margin-bottom: 10px; color: #856404;">⚙️ Methodology & Caveats</h3>
+            <ul>
+                <li><strong>Statistical Validation:</strong> All insights passed multi-layered statistical validation including sample size checks, p-value verification, and temporal stability tests.</li>
+                <li><strong>Confidence Levels:</strong> "High" confidence (>75%) indicates strong statistical evidence. "Medium" (40-75%) indicates preliminary signals. "Low" (<40%) insights are filtered out.</li>
+                <li><strong>Causal Claims:</strong> Causal language is only used when explicit causal inference methods were applied. Correlational insights use "associated with" phrasing.</li>
+                <li><strong>Weak Signals:</strong> Insights marked as "weak signals" are exploratory and require further validation before acting on them.</li>
+                <li><strong>Forecasts:</strong> All forecasts include confidence intervals. Model selection was automated using AIC/BIC criteria.</li>
+                <li><strong>Limitations:</strong> This analysis is based on the provided historical data. External factors, market shifts, or data quality issues may affect real-world applicability.</li>
+            </ul>
+        </div>
+        
+        <footer>
+            <p>Generated by <strong>Autonomous Insight Engine</strong></p>
+            <p>Powered by AI-driven statistical analysis with human-grade rigor</p>
+            <p style="margin-top: 10px; font-size: 0.85em;">2026-02-07 19:30:12</p>
+        </footer>
+    </div>
+</body>
+</html>
+        
