@@ -232,8 +232,20 @@ class Hypothesis(BaseModel):
     numerator_concept: str = Field(description="Column name for numerator")
     denominator_concept: Optional[str] = Field(default=None, description="Column name for denominator (or None)")
     
+    # Flaw G Fix: Denominator scope (prevents sales/sales=1 trap)
+    denominator_scope: Optional[Literal["SAME_ROW", "GLOBAL_SUM", "GROUP_SUM"]] = Field(
+        default=None,
+        description="How to interpret denominator: SAME_ROW (different column), GLOBAL_SUM (sum of all), GROUP_SUM (sum per group)"
+    )
+    
     # Flaw 3 Fix: Guardrail linkage
     guardrail_applied: Optional[str] = Field(default=None, description="Guardrail rule_type if applicable (e.g., 'inverted_rank')")
+    
+    # Flaw I Fix: Explicit guardrail transformation
+    guardrail_transformation: Optional[str] = Field(
+        default=None,
+        description="Mathematical transformation for guardrail (e.g., 'INVERT(our_position) = (11 - our_position)')"
+    )
     
     # Priority and confidence
     priority: int = Field(ge=1, le=10, description="Priority from Phase 0.5 (1 = highest)")
