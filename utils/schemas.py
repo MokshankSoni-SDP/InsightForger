@@ -57,6 +57,22 @@ class LensRecommendation(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0, description="Confidence in this lens recommendation")
 
 
+class InsightDomain(BaseModel):
+    """Opportunity Surface: High-impact dimension-metric pair identified in Phase 0.5."""
+    domain_name: str = Field(description="Human-readable domain name (e.g., 'Brand-level Revenue Concentration')")
+    primary_dimension: str = Field(description="Column name of the dimension")
+    primary_metric: str = Field(description="Column name of the metric")
+    why_valuable: str = Field(description="Business rationale for this domain")
+    top_values_seen: List[str] = Field(
+        description="Actual unique values from data (prevents hallucination)"
+    )
+    variance_score: float = Field(
+        ge=0.0, le=1.0, 
+        description="0-1 score indicating variance/concentration in this domain"
+    )
+
+
+
 class EAMMapping(BaseModel):
     """Entity-Attribute-Measure functional mapping for metric resolution."""
     anchor: str = Field(description="Primary entity name (e.g., 'Product', 'Customer')")
@@ -102,6 +118,10 @@ class BusinessContext(BaseModel):
     recommended_lenses: List[LensRecommendation] = Field(
         default_factory=list,
         description="Analytical lenses to activate in Phase 1 (Council of Lenses)"
+    )
+    insight_domains: List[InsightDomain] = Field(
+        default_factory=list,
+        description="Opportunity Surfaces (high-impact dimension-metric pairs) for Phase 1 expansion"
     )
     eam_mapping: List[EAMMapping] = Field(
         default_factory=list,
@@ -226,6 +246,13 @@ class Hypothesis(BaseModel):
     aggregation_scope: AggregationScope = Field(description="How to aggregate: GLOBAL, TEMPORAL, or DIMENSIONAL")
     time_grain: Optional[str] = Field(default=None, description="Time granularity if TEMPORAL (e.g., 'daily', 'weekly')")
     
+    # Motif Identification (Phase 0.5/1 Enhancement)
+    motif: Optional[Literal["Pareto", "Elasticity", "Velocity", "Benchmark"]] = Field(
+        default=None,
+        description="Analytical motif used to generate this hypothesis (guides Phase 3 execution strategy)"
+    )
+
+    
     # Dimensions and metric structure
     dimensions: List[str] = Field(default_factory=list, description="Columns to slice by (e.g., ['category', 'region'])")
     metric_template: str = Field(description="Math type: SUM, RATIO, GROWTH, MEAN, etc.")
@@ -237,6 +264,9 @@ class Hypothesis(BaseModel):
         default=None,
         description="How to interpret denominator: SAME_ROW (different column), GLOBAL_SUM (sum of all), GROUP_SUM (sum per group)"
     )
+    
+    # Phase 2 Output Integration
+    polars_expression: Optional[str] = Field(default=None, description="Pre-resolved Polars expression from Phase 2")
     
     # Flaw 3 Fix: Guardrail linkage
     guardrail_applied: Optional[str] = Field(default=None, description="Guardrail rule_type if applicable (e.g., 'inverted_rank')")
@@ -379,7 +409,7 @@ class AnalysisReport(BaseModel):
 # PHASE 2: EXECUTION PLAN (Autonomous Metric Resolution)
 # ============================================================================
 
-class ExecutionPlan(BaseModel):
+class Phase2Plan(BaseModel):
     """
     Validated execution plan for Phase 3.
     

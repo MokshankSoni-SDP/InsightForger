@@ -154,13 +154,13 @@ class ExecutionPlanner:
         dtypes = {col: str(self.df[col].dtype) for col in column_names}
         
         # Improvement #2: Explicit semantic hints
-        semantic_hints = f"""
+        semantic_hints = f'''
 Semantic Column Categories:
 - Time Columns: {', '.join(self.time_columns) if self.time_columns else 'None'}
 - Numeric Columns: {', '.join(self.numeric_columns[:20])}
 - Categorical Columns: {', '.join(self.categorical_columns[:10]) if self.categorical_columns else 'None'}
 - Identifier Columns (DO NOT USE): {', '.join(self.identifier_columns[:5]) if self.identifier_columns else 'None'}
-"""
+'''
         
         type_guidance = self._get_type_specific_guidance(hypothesis.expected_insight_type)
         
@@ -236,40 +236,12 @@ CRITICAL RULES:
 8. Metric '{hypothesis.resolved_metric}' MUST exist or be created in the code
 
 Return ONLY the Python code, no explanations.
-
-Example skeleton:
-```python
-import polars as pl
-import numpy as np
-from scipy.stats import pearsonr
-
-try:
-    # 1. Prepare Data (create derived metric if needed)
-    # ... calculation ...
-    
-    # 2. Clean Data
-    clean_df = df.drop_nulls(['{hypothesis.resolved_metric}'])
-    
-    # 3. Analyze
-    metric_data = clean_df['{hypothesis.resolved_metric}'].to_numpy()
-    
-    # 4. Compute result
-    result = {{
-        "metric": "{hypothesis.resolved_metric}",
-        "value": float(metric_data.mean()),
-        "p_value": 0.05,
-        "confidence": 0.95,
-        "sample_size": len(metric_data),
-        "interpretation": "Brief finding",
-        "_meta": {{
-            "method": "descriptive_stats",
-            "assumptions": ["no_missing"],
-            "warnings": []
-        }}
-    }}
-except Exception as e:
-    result = {{"error": str(e), "metric": "{hypothesis.resolved_metric}"}}
-```"""
+"""
+        
+        # Improvement: Direct Code Generation for Phase 2 Plans
+        if hypothesis.polars_expression:
+            logger.info(f"Generating optimized code from pre-resolved Polars expression: {hypothesis.polars_expression}")
+            return self._generate_direct_code(hypothesis)
 
         try:
             response = self.client.chat.completions.create(
@@ -311,44 +283,107 @@ except Exception as e:
         """Get type-specific implementation guidance."""
         
         guidance = {
-            "trend": """
-For TREND analysis:
-- Use time column as x-axis
-- Use scipy.stats.linregress or sklearn.linear_model.LinearRegression
-- Return slope, p-value, r_squared
-- _meta.method = "linear_regression"
-- _meta.assumptions = ["linearity", "independence"]
-""",
-            "correlation": """
-For CORRELATION analysis:
-- Use scipy.stats.pearsonr (if linear) or spearmanr (if monotonic)
-- Clean both metrics (drop nulls)
-- Return correlation coefficient and p-value
-- _meta.method = "pearson_correlation" or "spearman_correlation"
-- _meta.assumptions = ["linearity", "no_outliers"] or ["monotonicity"]
-""",
-            "anomaly": """
-For ANOMALY detection:
-- Use IQR method (Q1-1.5*IQR, Q3+1.5*IQR) or z-score (>3 or <-3)
-- Return count of anomalies and percentage
-- _meta.method = "iqr" or "z_score"
-- _meta.assumptions = ["normal_distribution"] (for z-score)
-""",
-            "forecast": """
-For FORECAST analysis:
-- Sort by time column first
-- Use statsmodels ARIMA or exponential smoothing
-- Forecast next 3-5 periods
-- Return forecasted values and confidence intervals
-- _meta.method = "arima" or "exp_smoothing"
-- _meta.assumptions = ["stationarity", "no_missing_time"]
-- _meta.warnings = note any seasonality or trends
-""",
-            "causal": """
-CAUSAL analysis is NOT supported here.
-This should have been filtered by preflight check.
-If you see this, there's a bug in the feasibility checker.
-"""
+            "trend": (
+                "For TREND analysis:\n"
+                "- Use time column as x-axis\n"
+                "- Use scipy.stats.linregress or sklearn.linear_model.LinearRegression\n"
+                "- Return slope, p-value, r_squared\n"
+                "- _meta.method = 'linear_regression'\n"
+                "- _meta.assumptions = ['linearity', 'independence']"
+            ),
+            "correlation": (
+                "For CORRELATION analysis:\n"
+                "- Use scipy.stats.pearsonr (if linear) or spearmanr (if monotonic)\n"
+                "- Clean both metrics (drop nulls)\n"
+                "- Return correlation coefficient and p-value\n"
+                "- _meta.method = 'pearson_correlation' or 'spearman_correlation'\n"
+                "- _meta.assumptions = ['linearity', 'no_outliers'] or ['monotonicity']"
+            ),
+            "anomaly": (
+                "For ANOMALY detection:\n"
+                "- Use IQR method (Q1-1.5*IQR, Q3+1.5*IQR) or z-score (>3 or <-3)\n"
+                "- Return count of anomalies and percentage\n"
+                "- _meta.method = 'iqr' or 'z_score'\n"
+                "- _meta.assumptions = ['normal_distribution'] (for z-score)"
+            ),
+            "forecast": (
+                "For FORECAST analysis:\n"
+                "- Sort by time column first\n"
+                "- Use statsmodels ARIMA or exponential smoothing\n"
+                "- Forecast next 3-5 periods\n"
+                "- Return forecasted values and confidence intervals\n"
+                "- _meta.method = 'arima' or 'exp_smoothing'\n"
+                "- _meta.assumptions = ['stationarity', 'no_missing_time']\n"
+                "- _meta.warnings = note any seasonality or trends"
+            ),
+            "causal": (
+                "CAUSAL analysis is NOT supported here.\n"
+                "This should have been filtered by preflight check.\n"
+                "If you see this, there's a bug in the feasibility checker."
+            )
         }
         
         return guidance.get(insight_type, "# No specific guidance for this type")
+
+    def _generate_direct_code(self, hypothesis: Hypothesis) -> str:
+        """Generate computation code directly from Polars expression without LLM."""
+        
+        # Determine aggregation logic
+        dims = hypothesis.dimensions if hypothesis.dimensions else []
+        
+        if dims:
+            # Group by dimensions
+            group_cols = ", ".join([f'"{d}"' for d in dims])
+            agg_lines = [
+                f'    # Group by dimensions: {dims}',
+                f'    result_df = df.group_by([{group_cols}]).agg([',
+                f'        ({hypothesis.polars_expression}).alias("{hypothesis.resolved_metric}")',
+                f'    ])'
+            ]
+        else:
+            # Global aggregation
+            agg_lines = [
+                f'    # Global aggregation',
+                f'    result_df = df.select([',
+                f'        ({hypothesis.polars_expression}).alias("{hypothesis.resolved_metric}")',
+                f'    ])'
+            ]
+        
+        agg_code = "\n".join(agg_lines)
+
+        # Build code block carefully to avoid f-string nesting issues
+        code_parts = [
+            "import polars as pl",
+            "import numpy as np",
+            "",
+            "try:",
+            "    # 1. Execute Pre-Resolved Expression",
+            agg_code,
+            "",
+            "    # 2. Extract Result",
+            "    result_data = result_df.to_dicts()",
+            "",
+            f'    # Calculate summary stat for the value field',
+            f'    metric_values = result_df["{hypothesis.resolved_metric}"].fill_null(0).to_list()',
+            f'    primary_value = float(np.mean(metric_values)) if metric_values else 0.0',
+            "",
+            "    result = {",
+            f'        "metric": "{hypothesis.resolved_metric}",',
+            f'        "value": primary_value,',
+            f'        "p_value": None,',
+            f'        "confidence": 1.0,',
+            f'        "sample_size": len(df),',
+            f'        "interpretation": "Direct calculation via {hypothesis.lens}",',
+            f'        "data": result_data,',
+            f'        "_meta": {{',
+            f'            "method": "exact_polars_expression",',
+            f'            "expression": "{hypothesis.polars_expression}",',
+            f'            "dimensions": {dims}',
+            f'        }}',
+            "    }",
+            "",
+            "except Exception as e:",
+            f'    result = {{"error": str(e), "metric": "{hypothesis.resolved_metric}"}}'
+        ]
+        
+        return "\n".join(code_parts)

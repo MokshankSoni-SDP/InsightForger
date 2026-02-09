@@ -119,7 +119,7 @@ class AutonomousInsightEngine:
         semantic_profile = self.profiler.profile_dataset()
         
         context_injector = ContextInjector(token_tracker=self.token_tracker)
-        business_context = context_injector.infer_context(semantic_profile)
+        business_context = context_injector.infer_context(semantic_profile, df=self.df)
         
         logger.info(f"✓ Context: {business_context.industry} - {business_context.business_type}")
         logger.info(f"  KPIs: {', '.join(business_context.top_kpis)}")

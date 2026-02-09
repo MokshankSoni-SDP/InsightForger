@@ -27,6 +27,51 @@ load_dotenv()
 logger = get_logger(__name__)
 
 
+# ============================================================================
+# ANALYTICAL MOTIF LIBRARY
+# ============================================================================
+
+ANALYTICAL_MOTIF_LIBRARY = {
+    "Pareto": {
+        "description": "Find dominance/concentration patterns",
+        "pattern": "Top N values drive X% of total",
+        "aggregation_scope": "GLOBAL",
+        "metric_template": "RATIO",
+        "denominator_scope": "GLOBAL_SUM",
+        "example": "Top 1 brand drives 96% of revenue",
+        "business_value": "Identify concentration risk or power law opportunities"
+    },
+    "Elasticity": {
+        "description": "Find multiplier/lift relationships",
+        "pattern": "For every $1 of X, we get $Y of Z",
+        "aggregation_scope": "DIMENSIONAL",
+        "metric_template": "RATIO",
+        "denominator_scope": "SAME_ROW",
+        "example": "ROAS of 15.26x for Position 1",
+        "business_value": "Optimize resource allocation by finding highest ROI levers"
+    },
+    "Velocity": {
+        "description": "Find growth/contraction speed",
+        "pattern": "Metric is changing at X% rate",
+        "aggregation_scope": "TEMPORAL",
+        "metric_template": "GROWTH",
+        "denominator_scope": "GROUP_SUM",
+        "example": "Revenue contracting at 29% monthly",
+        "business_value": "Detect momentum shifts before they become crises"
+    },
+    "Benchmark": {
+        "description": "Find outliers vs average",
+        "pattern": "Segment X performs Y times better than average",
+        "aggregation_scope": "DIMENSIONAL",
+        "metric_template": "RATIO",
+        "denominator_scope": "GLOBAL_SUM",
+        "example": "Category X performs 1.5x better than store average",
+        "business_value": "Identify best practices to replicate or underperformers to fix"
+    }
+}
+
+
+
 class LensAgent:
     """
     Level 10 Intelligence Lens Agent.
@@ -89,9 +134,34 @@ class LensAgent:
         )
     
     def _calculate_hypothesis_budget(self) -> int:
-        """Calculate number of hypotheses based on priority (INCREASED BUDGET)."""
-        budget_map = {1: 10, 2: 8, 3: 5, 4: 3}
-        return budget_map.get(self.lens_rec.priority, 2)
+        """
+        Calculate number of hypotheses based on Insight Domains and priority.
+        
+        New Logic: Generate 3-4 hypotheses per Insight Domain (one per motif).
+        Fallback: Use priority-based budget if no Insight Domains.
+        """
+        # If we have Insight Domains, scale budget by domain count
+        if self.business_context.insight_domains:
+            domain_count = len(self.business_context.insight_domains)
+            # Generate 3-4 hypotheses per domain (Pareto + Elasticity + Benchmark + Velocity)
+            # Velocity is optional (only if temporal data exists)
+            base_per_domain = 3  # Pareto, Elasticity, Benchmark
+            budget = domain_count * base_per_domain
+            
+            # Cap at reasonable maximum
+            budget = min(budget, 30)
+            
+            logger.info(
+                f"Hypothesis budget: {budget} (based on {domain_count} Insight Domains × {base_per_domain} motifs)"
+            )
+            return max(budget, 10)  # Minimum 10 even with few domains
+        
+        # Fallback: Priority-based budget (legacy logic)
+        budget_map = {1: 12, 2: 10, 3: 6, 4: 4}
+        budget = budget_map.get(self.lens_rec.priority, 3)
+        logger.info(f"Hypothesis budget: {budget} (priority-based, no Insight Domains)")
+        return budget
+
     
     def _generate_diverse_sample(self) -> List[Dict[str, Any]]:
         """
@@ -261,6 +331,31 @@ TEMPORAL GUIDANCE:
 - Primary Periodicity: {self.business_context.temporal_behavior.primary_periodicity if self.business_context.temporal_behavior else 'Unknown'}
 - Seasonality Expected: {self.business_context.temporal_behavior.seasonality_expected if self.business_context.temporal_behavior else 'Unknown'}
 
+=== ANALYTICAL MOTIF LIBRARY ===
+You MUST apply these proven patterns to generate hypotheses:
+
+{json.dumps(ANALYTICAL_MOTIF_LIBRARY, indent=2)}
+
+MOTIF APPLICATION RULE:
+For EACH Insight Domain from Phase 0.5, generate at least ONE hypothesis using each applicable motif.
+- Pareto: Find concentration/dominance patterns
+- Elasticity: Find multiplier/ROI relationships
+- Benchmark: Find outliers vs average
+- Velocity: Find growth/contraction (only if temporal data exists)
+
+=== INSIGHT DOMAINS FROM PHASE 0.5 ===
+{json.dumps([d.dict() for d in self.business_context.insight_domains], indent=2) if self.business_context.insight_domains else "No Insight Domains identified"}
+
+DOMAIN-DRIVEN MISSION:
+For EACH Insight Domain above:
+1. Apply the Pareto Motif: Find if top values dominate
+2. Apply the Elasticity Motif: Find multiplier relationships
+3. Apply the Benchmark Motif: Find outliers vs average
+4. Apply the Velocity Motif: Find growth/contraction (if temporal data exists)
+
+CRITICAL: Use the EXACT values from "top_values_seen" in your hypothesis descriptions.
+Example: "Is Asics revenue concentration a risk?" (NOT "Is Electronics revenue...")
+
 === THE LITERAL NAME LAW ===
 [CRITICAL] You are STRICTLY FORBIDDEN from changing column name casing!
 - If the column is "Category", you MUST write "Category" (not "category")
@@ -297,6 +392,7 @@ Return ONLY a JSON array of hypothesis objects. Each must have:
 - business_metric: Column name from AVAILABLE COLUMNS
 - aggregation_scope: GLOBAL | TEMPORAL | DIMENSIONAL
 - time_grain: "daily" | "weekly" | "monthly" (if TEMPORAL)
+- motif: Pareto | Elasticity | Velocity | Benchmark (which analytical pattern you used)
 - dimensions: List of EXACT column names from AVAILABLE COLUMNS
 - metric_template: RATIO | MEAN | SUM | GROWTH
 - numerator_concept: Business concept for numerator
@@ -589,17 +685,26 @@ class CouncilOfLenses:
         2. Same dimensions (order-independent)
         3. Same aggregation_scope
         4. Same time_grain (Shadow Flaw Fix)
+        5. Same motif or title pattern (Shadow Flaw Fix #2)
+        
+        Shadow Flaw Fix #2: Include motif in signature to prevent Pareto and Benchmark
+        hypotheses for the same metric from being treated as duplicates.
         """
         seen = {}
         
         for hyp in all_hypotheses:
-            # Create signature (Shadow Flaw Fix: include time_grain)
+            # Create signature (Shadow Flaw Fix: include time_grain AND motif/title)
             dims_sorted = tuple(sorted(hyp.dimensions))
+            
+            # Use motif if available, otherwise use title snippet for differentiation
+            motif_or_title = hyp.motif if hasattr(hyp, 'motif') and hyp.motif else hyp.title[:15]
+            
             signature = (
                 hyp.business_metric,
                 dims_sorted,
                 hyp.aggregation_scope,
-                hyp.time_grain  # Prevents merging daily vs weekly trends
+                hyp.time_grain,  # Prevents merging daily vs weekly trends
+                motif_or_title   # Prevents merging Pareto vs Benchmark for same metric
             )
             
             if signature in seen:

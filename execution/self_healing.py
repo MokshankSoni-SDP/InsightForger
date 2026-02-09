@@ -2,19 +2,22 @@
 Self-healing execution loop.
 
 Executes Python code with automatic error correction via LLM.
-Enhanced with timeout protection, sandboxed namespace, and healing memory.
+Enhanced with process isolation, Windows-compatible timeout protection, 
+sandboxed namespace, and healing memory.
 """
 import os
 import time
 import traceback
-import signal
+import multiprocessing
+import ast
+import json
 import difflib
-from typing import Dict, Any, Optional, List
-from contextlib import contextmanager
+from typing import Dict, Any, Optional, List, Union
 from dotenv import load_dotenv
 from litellm import completion
 import polars as pl
 import numpy as np
+import pandas as pd # often needed for compatibility
 from scipy import stats
 from scipy.stats import pearsonr, spearmanr
 from sklearn.preprocessing import StandardScaler
@@ -25,10 +28,72 @@ from utils.helpers import get_logger
 load_dotenv()
 logger = get_logger(__name__)
 
+# Fix for multiprocessing on Windows
+if os.name == 'nt':
+    # Ensure this is called only once
+    try:
+        multiprocessing.set_start_method('spawn')
+    except RuntimeError:
+        pass
 
-class TimeoutException(Exception):
-    """Raised when code execution times out."""
-    pass
+
+def _execute_in_process(code: str, df_parquet_path: str, result_queue: multiprocessing.Queue):
+    """
+    Worker function to run in a separate process.
+    Reads DataFrame from parquet to avoid pickling large objects directly
+    if we wanted to optimize, but for now we'll pass df via argument if small,
+    or reloading is safer for isolation.
+    
+    To keep it simple and robust:
+    We will accept the DF as a path (loading it fresh is safer for isolation).
+    """
+    try:
+        # Re-load data for complete isolation
+        df = pl.read_parquet(df_parquet_path)
+        
+        # Sandbox setup
+        safe_builtins = {
+            'abs': abs, 'all': all, 'any': any, 'bool': bool, 'dict': dict,
+            'enumerate': enumerate, 'float': float, 'int': int, 'len': len,
+            'list': list, 'max': max, 'min': min, 'range': range, 'round': round,
+            'sorted': sorted, 'str': str, 'sum': sum, 'tuple': tuple, 'zip': zip,
+            'ValueError': ValueError, 'TypeError': TypeError, 'KeyError': KeyError,
+            'Exception': Exception, 'print': print,
+            '__import__': __import__
+        }
+        
+        namespace = {
+            '__builtins__': safe_builtins,
+            'df': df,
+            'pl': pl,
+            'np': np,
+            'pd': pd,
+            'stats': stats,
+            'pearsonr': pearsonr,
+            'spearmanr': spearmanr,
+            'StandardScaler': StandardScaler,
+            'LinearRegression': LinearRegression,
+            'result': {}
+        }
+        
+        # Execute
+        exec(code, namespace)
+        
+        # Extract result
+        result = namespace.get('result', {})
+        
+        # Validate result type (must be pickle-able and dict)
+        if not isinstance(result, dict):
+             result_queue.put({"success": False, "error": "Code must set 'result' as a dictionary"})
+             return
+
+        # Ensure result is serializable
+        # We might need to convert some polars/numpy types to python native
+        # but let's try standard pickle first.
+        result_queue.put({"success": True, "data": result})
+        
+    except Exception as e:
+        result_queue.put({"success": False, "error": str(e), "trace": traceback.format_exc(), "type": type(e).__name__})
 
 
 class SelfHealingExecutor:
@@ -36,31 +101,30 @@ class SelfHealingExecutor:
     
     def __init__(self, df: pl.DataFrame):
         self.df = df
-        self.api_key = os.getenv("GROQ_API_KEY")
-        self.model = os.getenv("GROQ_MODEL", "groq/llama-3.1-70b-versatile")
-        if not self.model.startswith("groq/") and "llama" in self.model:
+        self.api_key = os.getenv("GROQ_API_KEY_4")
+        self.model = os.getenv("GROQ_MODEL", "groq/llama-3.3-70b-versatile")
+        
+        # Ensure model has groq/ prefix for litellm if it's a groq model
+        if "llama" in self.model and not self.model.startswith("groq/"):
              self.model = f"groq/{self.model}"
+             
         self.max_retries = int(os.getenv("MAX_RETRIES", "3"))
         self.execution_timeout = int(os.getenv("EXECUTION_TIMEOUT", "30"))  # seconds
         
-        # Improvement #5: Healing history
         self.healing_history: Dict[str, List[Dict[str, str]]] = {}
-    
+        
+        # Temporary storage for process isolation
+        self.temp_dir = "temp_execution"
+        os.makedirs(self.temp_dir, exist_ok=True)
+        self.df_path = os.path.join(self.temp_dir, "current_data.parquet")
+        
+        # Save DF once for workers to read
+        # In a real high-throughput system this might be slow, but for this agent it's safe
+        self.df.write_parquet(self.df_path)
+
     def execute_hypothesis(self, hypothesis: Hypothesis) -> ComputationResult:
         """
-        Execute hypothesis computation with self-healing.
-        
-        Improvements:
-        - Timeout protection
-        - Sandboxed execution
-        - Semantic guardrails
-        - Healing history tracking
-        
-        Args:
-            hypothesis: Hypothesis with computation plan
-            
-        Returns:
-            ComputationResult with success status and data
+        Execute hypothesis computation with self-healing and process isolation.
         """
         logger.info(f"Executing hypothesis: {hypothesis.id}")
         
@@ -68,21 +132,21 @@ class SelfHealingExecutor:
         retry_count = 0
         start_time = time.time()
         
-        # Initialize healing history for this hypothesis
         if hypothesis.id not in self.healing_history:
             self.healing_history[hypothesis.id] = []
-        
-        # Improvement #6: Track if same code was already tried
+            
         attempted_codes = set()
-        same_code_retry_allowed = False
         
         while retry_count <= self.max_retries:
             try:
-                # Improvement #1: Execute with timeout
-                result_data = self._execute_code_with_timeout(code)
+                # static analysis guardrail
+                if not self._validate_syntax_safety(code):
+                    raise ValueError("Code violates safety policies (uses forbidden modules or operations)")
+                
+                # Execute in separate process
+                result_data = self._run_in_process(code)
                 
                 execution_time = time.time() - start_time
-                
                 logger.info(f"✓ Hypothesis {hypothesis.id} executed successfully (retries: {retry_count})")
                 
                 return ComputationResult(
@@ -93,365 +157,216 @@ class SelfHealingExecutor:
                     retry_count=retry_count
                 )
                 
-            except TimeoutException as e:
-                retry_count += 1
-                error_msg = f"Execution timed out after {self.execution_timeout}s"
-                error_trace = str(e)
-                
-                logger.warning(f"⏱️ Timeout (attempt {retry_count}/{self.max_retries + 1}): {error_msg}")
-                
-                if retry_count > self.max_retries:
-                    execution_time = time.time() - start_time
-                    logger.error(f"✗ Hypothesis {hypothesis.id} failed after {self.max_retries} retries (timeout)")
-                    
-                    return ComputationResult(
-                        hypothesis_id=hypothesis.id,
-                        success=False,
-                        error_message=error_msg,
-                        result_data=None,
-                        execution_time=execution_time,
-                        retry_count=retry_count - 1
-                    )
-                
-                # For infinite loops, we can't heal - abort
-                logger.error("Cannot heal timeout errors (likely infinite loop) - aborting")
-                return ComputationResult(
-                    hypothesis_id=hypothesis.id,
-                    success=False,
-                    error_message=f"Execution timeout: {error_msg}",
-                    result_data=None,
-                    execution_time=time.time() - start_time,
-                    retry_count=retry_count
-                )
-                
             except Exception as e:
                 retry_count += 1
                 error_msg = str(e)
-                error_trace = traceback.format_exc()
                 error_type = type(e).__name__
+                
+                # If we got a detailed error dict from the worker, use it
+                full_trace = error_msg
+                if hasattr(e, 'trace'):
+                    full_trace = e.trace
                 
                 logger.warning(f"Execution failed (attempt {retry_count}/{self.max_retries + 1}): {error_type}: {error_msg}")
                 
                 if retry_count > self.max_retries:
-                    execution_time = time.time() - start_time
-                    logger.error(f"✗ Hypothesis {hypothesis.id} failed after {self.max_retries} retries")
-                    
                     return ComputationResult(
                         hypothesis_id=hypothesis.id,
                         success=False,
                         error_message=error_msg,
                         result_data=None,
-                        execution_time=execution_time,
+                        execution_time=time.time() - start_time,
                         retry_count=retry_count - 1
                     )
                 
-                # Improvement #3: Semantic guardrail - try simple fix first
+                # 1. Try simple regex fix
                 simple_fix = self._try_simple_fix(code, error_type, error_msg, hypothesis)
                 if simple_fix:
-                    logger.info(f"✓ Applied semantic guardrail fix for {error_type}")
+                    logger.info("✓ Applied semantic guardrail fix")
                     code = simple_fix
-                    attempted_codes.add(code)
                     continue
                 
-                # Attempt self-healing with LLM
+                # 2. Try LLM healing
                 logger.info(f"Attempting self-healing for {hypothesis.id}...")
-                healed_code = self._heal_code(code, error_msg, error_trace, error_type, hypothesis)
+                healed_code = self._heal_code(code, error_msg, full_trace, error_type, hypothesis)
                 
-                # Improvement #6: Allow same code retry once
-                if healed_code:
-                    code_changed = healed_code != code
-                    
-                    if code_changed:
-                        # New code, proceed with retry
-                        code = healed_code
-                        attempted_codes.add(code)
-                        same_code_retry_allowed = True
-                        logger.info("Code healed with changes, retrying execution")
-                    elif not same_code_retry_allowed and healed_code not in attempted_codes:
-                        # Same code but first time seeing it - allow one retry
-                        code = healed_code
-                        attempted_codes.add(code)
-                        same_code_retry_allowed = False  # Only once
-                        logger.info("Code unchanged but allowing one retry (may be transient error)")
-                    else:
-                        # Same code and already tried - abort
-                        logger.warning("Healed code identical and already attempted - aborting")
-                        execution_time = time.time() - start_time
-                        return ComputationResult(
-                            hypothesis_id=hypothesis.id,
-                            success=False,
-                            error_message=f"Healing oscillating or stuck: {error_msg}",
-                            result_data=None,
-                            execution_time=execution_time,
-                            retry_count=retry_count
-                        )
+                if healed_code and healed_code != code and healed_code not in attempted_codes:
+                    code = healed_code
+                    attempted_codes.add(code)
+                    logger.info("Code healed, retrying execution")
                 else:
-                    # Healing failed completely
-                    execution_time = time.time() - start_time
+                    logger.error("Healing failed or produced duplicate/empty code.")
+                    # If healing fails, we abort this cycle
                     return ComputationResult(
                         hypothesis_id=hypothesis.id,
                         success=False,
                         error_message=f"Healing failed: {error_msg}",
                         result_data=None,
-                        execution_time=execution_time,
+                        execution_time=time.time() - start_time,
                         retry_count=retry_count
                     )
-    
-    def _execute_code_with_timeout(self, code: str) -> Dict[str, Any]:
-        """
-        Improvement #1: Execute code with timeout protection.
-        
-        Uses signal.alarm on Unix or manual timeout tracking on Windows.
-        """
-        # Improvement #2: Create sandboxed namespace
-        namespace = self._create_sandboxed_namespace()
-        
-        def timeout_handler(signum, frame):
-            raise TimeoutException(f"Code execution exceeded {self.execution_timeout}s timeout")
-        
-        # Try to use signal-based timeout (Unix-like systems)
+
+        # Should not reach here
+        return ComputationResult(hypothesis_id=hypothesis.id, success=False, error_message="Unknown error", result_data=None, retry_count=retry_count)
+
+    @staticmethod
+    def _validate_syntax_safety(code: str) -> bool:
+        """Execute basic AST safety checks on generated code."""
         try:
-            old_handler = signal.signal(signal.SIGALRM, timeout_handler)
-            signal.alarm(self.execution_timeout)
-            
-            try:
-                exec(code, namespace)
-            finally:
-                signal.alarm(0)  # Cancel alarm
-                signal.signal(signal.SIGALRM, old_handler)
-        
-        except AttributeError:
-            # Windows doesn't have SIGALRM - fallback to manual check
-            # Note: This won't interrupt infinite loops, but better than nothing
-            logger.warning("SIGALRM not available - timeout protection limited on Windows")
-            exec(code, namespace)
-        
-        # Extract result
-        result = namespace.get('result', {})
-        
-        if not isinstance(result, dict):
-            raise ValueError("Code must set 'result' as a dictionary")
-        
-        return result
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                # Check imports
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    if isinstance(node, ast.Import):
+                        for name in node.names:
+                            if name.name in ['os', 'sys', 'subprocess', 'shutil', 'socket']:
+                                logger.error(f"Safety Violation: Forbidden import '{name.name}'")
+                                return False
+                    elif isinstance(node, ast.ImportFrom):
+                        module = node.module
+                        if module in ['os', 'sys', 'subprocess', 'shutil', 'socket']:
+                            logger.error(f"Safety Violation: Forbidden import from '{module}'")
+                            return False
+                
+                # Check for open() calls - rough check
+                if isinstance(node, ast.Call):
+                     if isinstance(node.func, ast.Name) and node.func.id == 'open':
+                         logger.error("Safety Violation: Use of 'open()' is forbidden")
+                         return False
+            return True
+        except SyntaxError as e:
+            logger.error(f"Safety Violation: Syntax Error in generated code: {e}")
+            return False # Let execution fail naturally if syntax is bad, or treat as unsafe
     
-    def _create_sandboxed_namespace(self) -> Dict[str, Any]:
+    def _run_in_process(self, code: str) -> Dict[str, Any]:
         """
-        Improvement #2: Create sandboxed execution namespace.
-        
-        Restricts access to dangerous builtins and explicitly whitelists
-        safe libraries and functions.
+        Run code in a separate process with hard timeout.
+        This works on Windows because we terminate the process handle.
         """
-        # Start with minimal builtins
-        safe_builtins = {
-            'abs': abs,
-            'all': all,
-            'any': any,
-            'bool': bool,
-            'dict': dict,
-            'enumerate': enumerate,
-            'float': float,
-            'int': int,
-            'len': len,
-            'list': list,
-            'max': max,
-            'min': min,
-            'range': range,
-            'round': round,
-            'sorted': sorted,
-            'str': str,
-            'sum': sum,
-            'tuple': tuple,
-            'zip': zip,
-            'ValueError': ValueError,
-            'TypeError': TypeError,
-            'KeyError': KeyError,
-            'Exception': Exception,
-            '__import__': __import__,  # Needed for import statements in generated code
-        }
         
-        # Create namespace with whitelisted modules
-        namespace = {
-            '__builtins__': safe_builtins,
-            'df': self.df,
-            'pl': pl,
-            'np': np,
-            'stats': stats,
-            'pearsonr': pearsonr,
-            'spearmanr': spearmanr,
-            'StandardScaler': StandardScaler,
-            'LinearRegression': LinearRegression,
-            'result': {}
-        }
+        # We need a way to get the result back. Queue is thread/process safe.
+        queue = multiprocessing.Queue()
         
-        return namespace
-    
-    def _try_simple_fix(
-        self, 
-        code: str, 
-        error_type: str, 
-        error_msg: str,
-        hypothesis: Hypothesis
-    ) -> Optional[str]:
-        """
-        Improvement #3: Semantic guardrail - try simple fixes before LLM.
+        # Create the process
+        # We target the module-level function `_execute_in_process` so it's picklable
+        p = multiprocessing.Process(
+            target=_execute_in_process,
+            args=(code, self.df_path, queue)
+        )
         
-        For common errors, apply deterministic fixes without LLM call.
-        """
-        # KeyError: Column doesn't exist
-        if error_type == "KeyError" and "'" in error_msg:
-            missing_col = error_msg.split("'")[1]
-            # Find nearest column name
-            available_cols = self.df.columns
-            close_matches = difflib.get_close_matches(missing_col, available_cols, n=1, cutoff=0.6)
+        p.start()
+        
+        # Wait for completion or timeout
+        p.join(timeout=self.execution_timeout)
+        
+        if p.is_alive():
+            logger.error(f"⏱️ Execution timed out after {self.execution_timeout}s - Killing process")
+            p.terminate()
+            p.join() # Clean up resources
+            raise TimeoutError(f"Execution timed out after {self.execution_timeout} seconds")
             
-            if close_matches:
-                suggested_col = close_matches[0]
-                logger.info(f"KeyError guardrail: suggesting '{suggested_col}' instead of '{missing_col}'")
-                fixed_code = code.replace(f"'{missing_col}'", f"'{suggested_col}'")
-                fixed_code = fixed_code.replace(f'"{missing_col}"', f'"{suggested_col}"')
-                return fixed_code
+        # If process finished, check the queue
+        if queue.empty():
+            # Process died without writing to queue (Segfault, MemoryError, or harsh kill)
+            if p.exitcode != 0:
+                raise RuntimeError(f"Process crashed with exit code {p.exitcode}")
+            else:
+                raise RuntimeError("Process finished but returned no result")
+            
+        result_packet = queue.get()
         
-        # ZeroDivisionError: Add epsilon
-        elif error_type == "ZeroDivisionError":
-            logger.info("ZeroDivisionError guardrail: adding epsilon protection")
-            # Add epsilon to prevent division by zero
-            if "/" in code and "epsilon" not in code:
-                # Insert epsilon definition at start
-                fixed_code = "epsilon = 1e-10\n" + code
-                # This is a heuristic - real fix would be more surgical
-                return fixed_code
+        if not result_packet["success"]:
+            # Reconstruct the exception to bubble up
+            error_msg = result_packet.get("error", "Unknown Process Error")
+            # We attach the trace to the exception object dynamically for the healer
+            exc = RuntimeError(error_msg)
+            exc.trace = result_packet.get("trace", "")
+            raise exc
+            
+        return result_packet["data"]
+
+    def _try_simple_fix(self, code: str, error_type: str, error_msg: str, hypothesis: Hypothesis) -> Optional[str]:
+        """Apply deterministic fixes for common errors."""
         
-        # TypeError: dtype mismatch
-        elif error_type == "TypeError" and "dtype" in error_msg.lower():
-            logger.info("TypeError guardrail: attempting dtype cast")
-            # Try to add .cast(pl.Float64) where needed
-            # This is a simplified heuristic
-            pass
+        # KeyError / Column missing
+        if error_type == "KeyError" or "ColumnNotFoundError" in error_type:
+             # Extract column name from error message if possible
+             # Typical msg: "KeyError: 'foo'" or "Column 'foo' not found"
+             import re
+             match = re.search(r"'([^']*)'", error_msg)
+             if match:
+                 missing_col = match.group(1)
+                 # find closest match
+                 cols = self.df.columns
+                 matches = difflib.get_close_matches(missing_col, cols, n=1, cutoff=0.7)
+                 if matches:
+                     suggestion = matches[0]
+                     logger.info(f"Guardrail: Replacing '{missing_col}' with '{suggestion}'")
+                     return code.replace(f"'{missing_col}'", f"'{suggestion}'").replace(f'"{missing_col}"', f'"{suggestion}"')
+        
+        # Division by zero
+        if "division by zero" in error_msg.lower() or error_type == "ZeroDivisionError":
+             if "epsilon" not in code:
+                 return "epsilon = 1e-9\n" + code.replace("/", "/ (").replace(";", ") + epsilon;") # flawed heuristic but simple try
         
         return None
-    
-    def _heal_code(
-        self, 
-        code: str, 
-        error_msg: str, 
-        error_trace: str,
-        error_type: str,
-        hypothesis: Hypothesis
-    ) -> Optional[str]:
-        """
-        Use LLM to fix broken code.
+
+    def _heal_code(self, code: str, error_msg: str, error_trace: str, error_type: str, hypothesis: Hypothesis) -> Optional[str]:
+        """Ask LLM to fix the code."""
         
-        Improvements:
-        - Pass expected output schema
-        - Include healing history
-        - Provide full error context
-        """
-        # Improvement #5: Get healing history
+        # Context history
         history = self.healing_history.get(hypothesis.id, [])
-        history_text = ""
-        if history:
-            history_text = "\n\nPrevious Healing Attempts:\n"
-            for i, attempt in enumerate(history[-2:], 1):  # Last 2 attempts
-                history_text += f"\nAttempt {i}:\n"
-                history_text += f"Error: {attempt['error'][:100]}\n"
-                history_text += f"Fix Applied: {attempt['fix_description']}\n"
+        history_txt = "\n".join([f"- Prevented Error: {h['error']}" for h in history[-2:]])
         
-        # Improvement #4: Expected output schema
-        expected_schema = """
-Expected result schema (MANDATORY):
-{
-    "metric": str,              # hypothesis.metric_target
-    "value": float | int,       # primary finding
-    "p_value": float | None,    # statistical significance
-    "confidence": float,        # confidence score/interval
-    "interpretation": str,      # one-line summary
-    "_meta": {
-        "method": str,          # e.g., "pearson_correlation"
-        "assumptions": List[str],
-        "n_samples": int,
-        "warnings": List[str]
-    }
-}
-"""
-        
-        prompt = f"""You are debugging Python code that failed. Fix the error and return ONLY the corrected code.
+        prompt = f"""
+You are an expert Python Data Science debugger. Fix the code execution error.
 
-Original Hypothesis: {hypothesis.title}
-Analysis Type: {hypothesis.expected_insight_type}
-Target Metric: {hypothesis.resolved_metric}
-{f"Related Metric: {getattr(hypothesis, 'related_metric', None)}" if getattr(hypothesis, 'related_metric', None) else ""}
+CONTEXT:
+Hypothesis: {hypothesis.title}
+Metric: {hypothesis.resolved_metric}
+Error Type: {error_type}
+Error Message: {error_msg}
 
-{expected_schema}
+TRACEBACK:
+{error_trace[-600:]}
 
-Failed Code:
+PREVIOUS ATTEMPTS:
+{history_txt}
+
+DF SCHEMA:
+Columns: {self.df.columns}
+
+BROKEN CODE:
 ```python
 {code}
 ```
 
-Error Type: {error_type}
-Error Message: {error_msg}
-
-Error Trace (last 800 chars):
-{error_trace[-800:]}
-
-Available DataFrame: 'df' (polars DataFrame)
-Columns: {', '.join(self.df.columns[:20])}
-Numeric Columns: {', '.join([c for c in self.df.columns if self.df[c].dtype in [pl.Int32, pl.Int64, pl.Float32, pl.Float64]][:15])}
-
-{history_text}
-
-CRITICAL RULES:
-1. Fix the SPECIFIC error - don't change working logic
-2. Maintain the same analysis approach (e.g., if correlation, keep correlation)
-3. Return ONLY valid Python code in a code block
-4. ALWAYS set 'result' dict with the schema above
-5. Use polars syntax (not pandas)
-6. Handle edge cases:
-   - Null values (use .drop_nulls() or .fill_null())
-   - Division by zero (add epsilon = 1e-10)
-   - Empty dataframes after filtering
-7. If column doesn't exist, use closest match from available columns
-8. Ensure result conforms to expected schema
-
-Return the fixed code in a code block."""
-
+INSTRUCTIONS:
+1. Return ONLY the full, corrected Python code inside ```python``` blocks.
+2. Fix the specific error shown.
+3. Ensure 'result' dictionary is assigned at the end.
+4. Do NOT use markdown outside the code blocks.
+5. Do NOT change the logic intent, just fix the bug (e.g., column names, syntax, types).
+"""
         try:
             response = completion(
                 model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert Python debugger. Fix code errors precisely while preserving analysis intent."},
-                    {"role": "user", "content": prompt}
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 api_key=self.api_key,
-                temperature=0.1,
-                max_tokens=1200
+                temperature=0.1
             )
-            
             content = response.choices[0].message.content
             
-            # Extract code
+            # Extract code block
             if "```python" in content:
-                code_start = content.find("```python") + 9
-                code_end = content.find("```", code_start)
-                healed_code = content[code_start:code_end].strip()
-            elif "```" in content:
-                code_start = content.find("```") + 3
-                code_end = content.find("```", code_start)
-                healed_code = content[code_start:code_end].strip()
-            else:
-                healed_code = content.strip()
+                return content.split("```python")[1].split("```")[0].strip()
+            if "```" in content:
+                # fallback if they forgot python tag
+                return content.split("```")[1].split("```")[0].strip()
             
-            # Improvement #5: Record healing attempt
-            self.healing_history[hypothesis.id].append({
-                "error": error_msg,
-                "error_type": error_type,
-                "fix_description": f"Healed {error_type}",
-                "code_length": len(healed_code)
-            })
-            
-            logger.info("Code healing completed")
-            return healed_code
+            # Fallback: assume whole message is code if no blocks
+            return content.strip()
             
         except Exception as e:
-            logger.error(f"Code healing failed: {e}")
+            logger.error(f"LLM Healing failed: {e}")
             return None

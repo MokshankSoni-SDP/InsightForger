@@ -17,6 +17,8 @@ Enhancements:
 import os
 import json
 import re
+import polars as pl
+import pandas as pd
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from groq import Groq
@@ -231,7 +233,114 @@ class ContextInjector:
         logger.info(f"Lens budget calculated: {lens_budget} lenses (based on {estimated_anchors} anchors)")
         return lens_budget
     
-    def infer_context(self, profile: SemanticProfile) -> BusinessContext:
+    def _calculate_impact_metrics(
+        self, 
+        df: Any,  # polars or pandas DataFrame
+        column_name: str,
+        financial_columns: List[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Calculate impact metrics for categorical column (dual-context profiling).
+        
+        Returns top values by:
+        - Frequency (row count)
+        - Sales/Revenue impact (if financial column exists)
+        - Cost impact (if cost column exists)
+        
+        Args:
+            df: DataFrame (polars or pandas)
+            column_name: Categorical column to analyze
+            financial_columns: List of financial column names from profile
+            
+        Returns:
+            Dict with 'top_by_frequency', 'top_by_sales', 'top_by_cost'
+        """
+        
+        
+        # Convert to polars if needed
+        if isinstance(df, pd.DataFrame):
+            df_pl = pl.from_pandas(df)
+        else:
+            df_pl = df
+        
+        result = {}
+        
+        try:
+            # Top by frequency
+            freq_df = (
+                df_pl.group_by(column_name)
+                .agg(pl.count().alias("count"))
+                .sort("count", descending=True)
+                .head(5)
+            )
+            
+            total_rows = len(df_pl)
+            result["top_by_frequency"] = [
+                {
+                    "value": str(row[column_name]),
+                    "count": int(row["count"]),
+                    "pct": round(100 * row["count"] / total_rows, 1)
+                }
+                for row in freq_df.to_dicts()
+            ]
+            
+            # Top by sales/revenue (find first financial column)
+            sales_col = None
+            for col in financial_columns:
+                if any(keyword in col.lower() for keyword in ['sales', 'revenue', 'income', 'gmv']):
+                    if col in df_pl.columns:
+                        sales_col = col
+                        break
+            
+            if sales_col:
+                sales_df = (
+                    df_pl.group_by(column_name)
+                    .agg(pl.col(sales_col).sum().alias("total_sales"))
+                    .sort("total_sales", descending=True)
+                    .head(5)
+                )
+                
+                total_sales = df_pl[sales_col].sum()
+                result["top_by_sales"] = [
+                    {
+                        "value": str(row[column_name]),
+                        "total_sales": round(float(row["total_sales"]), 2),
+                        "pct": round(100 * row["total_sales"] / total_sales, 1) if total_sales and total_sales > 0 else 0
+                    }
+                    for row in sales_df.to_dicts()
+                ]
+            
+            # Top by cost (find first cost column)
+            cost_col = None
+            for col in financial_columns:
+                if any(keyword in col.lower() for keyword in ['cost', 'spend', 'expense', 'adcost']):
+                    if col in df_pl.columns:
+                        cost_col = col
+                        break
+            
+            if cost_col:
+                cost_df = (
+                    df_pl.group_by(column_name)
+                    .agg(pl.col(cost_col).sum().alias("total_cost"))
+                    .sort("total_cost", descending=True)
+                    .head(5)
+                )
+                
+                result["top_by_cost"] = [
+                    {
+                        "value": str(row[column_name]),
+                        "total_cost": round(float(row["total_cost"]), 2)
+                    }
+                    for row in cost_df.to_dicts()
+                ]
+        
+        except Exception as e:
+            logger.warning(f"Failed to calculate impact metrics for {column_name}: {e}")
+        
+        return result
+    
+    
+    def infer_context(self, profile: SemanticProfile, df: Any = None) -> BusinessContext:
         """
         Use LLM to infer business context from semantic profile.
         
@@ -241,9 +350,11 @@ class ContextInjector:
         - Semantic requirement validation for KPIs
         - Chain-of-thought prompting
         - Formula library integration
+        - Dual-context profiling (frequency + financial impact)
         
         Args:
             profile: Semantic profile of the dataset
+            df: Optional DataFrame for impact analysis (polars or pandas)
             
         Returns:
             BusinessContext with confidence and reasoning
@@ -289,6 +400,27 @@ class ContextInjector:
                         }
                 except:
                     pass
+            
+            # DUAL-CONTEXT PROFILING: Add impact metrics for categorical columns
+            if entity.statistical_type == "categorical" and df is not None:
+                try:
+                    impact_metrics = self._calculate_impact_metrics(
+                        df, 
+                        entity.column_name,
+                        profile.numeric_columns  # Pass all numeric columns as potential financial columns
+                    )
+                    
+                    # Add to info if we got results
+                    if impact_metrics.get("top_by_frequency"):
+                        info["top_by_frequency"] = impact_metrics["top_by_frequency"]
+                    if impact_metrics.get("top_by_sales"):
+                        info["top_by_sales"] = impact_metrics["top_by_sales"]
+                    if impact_metrics.get("top_by_cost"):
+                        info["top_by_cost"] = impact_metrics["top_by_cost"]
+                    
+                    logger.debug(f"Added impact metrics for {entity.column_name}")
+                except Exception as e:
+                    logger.warning(f"Failed to add impact metrics for {entity.column_name}: {e}")
             
             column_info.append(info)
         
@@ -667,6 +799,40 @@ STEP 2: DEDUCE
 If you were the CEO, which 3 columns keep you awake at night?
 If you had to write 5 SQL queries to find "hidden money" in this data, what would the WHERE and GROUP BY clauses be?
 
+STEP 2.5: IDENTIFY OPPORTUNITY SURFACES (INSIGHT DOMAINS)
+
+An "Insight Domain" is a specific [Dimension × Metric] pair where you see potential for hidden value:
+- **High Variance**: Wide range in sample values or impact metrics (e.g., top_by_sales shows one value with 41% while others have 5%)
+- **Concentration**: One or few values dominate (e.g., "Asics" has 96% of sales)
+- **Leverage**: The metric is financially critical (sales, revenue, cost, conversions)
+- **Friction Point**: The dimension represents a strategic choice (brand, channel, product, position)
+
+CRITICAL RULES FOR INSIGHT DOMAINS:
+1. **Use EXACT Values**: The "top_values_seen" field MUST contain actual values from the data samples or impact metrics
+2. **No Hallucination**: If you see "Running Shoes" in top_by_frequency, use "Running Shoes" NOT "Electronics"
+3. **Financial Focus**: Prioritize domains where the metric is financial (sales, cost, revenue, profit)
+4. **Variance Required**: Only create domains where you see clear variance or concentration in the impact metrics
+
+For each Insight Domain, provide:
+- domain_name: Human-readable name (e.g., "Brand-level Revenue Concentration")
+- primary_dimension: Column name (e.g., "Brand")
+- primary_metric: Column name (e.g., "Sales")
+- why_valuable: Business rationale (e.g., "Revenue is dangerously concentrated in single brand - 96% from Asics")
+- top_values_seen: List of EXACT values from data (e.g., ["Asics", "Nike", "New Balance"])
+- variance_score: 0.0-1.0 score (0.9 = extreme concentration, 0.5 = moderate variance, 0.2 = uniform)
+
+Example Insight Domain:
+{{
+  "domain_name": "Brand-level Revenue Concentration",
+  "primary_dimension": "Brand",
+  "primary_metric": "Sales",
+  "why_valuable": "Revenue is dangerously concentrated - Asics drives 96% of sales",
+  "top_values_seen": ["Asics", "Nike", "New Balance"],
+  "variance_score": 0.95
+}}
+
+IDENTIFY 3-5 INSIGHT DOMAINS (prioritize by financial impact).
+
 STEP 3: ORCHESTRATE LENSES (CRITICAL)
 You MUST recommend exactly {lens_budget} lenses (no more, no less).
 
@@ -843,6 +1009,16 @@ STEP 8: OUTPUT JSON
       "objective": "...",
       "supporting_columns": [...],
       "confidence": 0.0-1.0
+    }}
+  ],
+  "insight_domains": [
+    {{
+      "domain_name": "...",
+      "primary_dimension": "column_name",
+      "primary_metric": "column_name",
+      "why_valuable": "...",
+      "top_values_seen": ["exact_value_1", "exact_value_2"],
+      "variance_score": 0.0-1.0
     }}
   ],
   "eam_mapping": [
